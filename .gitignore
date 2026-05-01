@@ -1,0 +1,25 @@
+# Go
+/zubrameet
+/zubrameet.exe
+*.exe
+*.test
+*.out
+
+# Node / web
+node_modules/
+.vite/
+.parcel-cache/
+*.tsbuildinfo
+
+# Build artefacts (web/dist tracked via .gitkeep only)
+web/dist/*
+!web/dist/.gitkeep
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
