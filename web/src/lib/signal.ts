@@ -14,6 +14,34 @@ export class SignalClient {
   }
 
   connect(): Promise<void> {
+    return this.openSocket();
+  }
+
+  /**
+   * Закрыть текущий ws (если есть) и открыть новый на тот же url.
+   * Внешние (closeHandlers) подписки и handlers сообщений сохраняются —
+   * они привязаны к классу, а не к конкретному WebSocket.
+   */
+  reconnect(): Promise<void> {
+    const old = this.ws;
+    if (old) {
+      // Снимаем onclose, чтобы close старого сокета не выстрелил closeHandlers
+      // (иначе оркестратор подумает, что произошёл ещё один disconnect).
+      old.onclose = null;
+      old.onerror = null;
+      old.onmessage = null;
+      old.onopen = null;
+      try {
+        old.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.ws = null;
+    return this.openSocket();
+  }
+
+  private openSocket(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       let ws: WebSocket;

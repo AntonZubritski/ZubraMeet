@@ -3,8 +3,10 @@ import { useState, type CSSProperties, type ReactNode } from 'react';
 interface Props {
   micOn: boolean;
   camOn: boolean;
+  screenSharing: boolean;
   onToggleMic(): void;
   onToggleCam(): void;
+  onToggleScreenShare(): void;
   onLeave(): void;
   onCopyInvite(): void;
 }
@@ -27,7 +29,7 @@ const barStyle: CSSProperties = {
   zIndex: 100,
 };
 
-type Variant = 'default' | 'off' | 'leave';
+type Variant = 'default' | 'off' | 'leave' | 'active';
 
 function buttonStyle(variant: Variant, hovered: boolean): CSSProperties {
   const base: CSSProperties = {
@@ -60,6 +62,15 @@ function buttonStyle(variant: Variant, hovered: boolean): CSSProperties {
       color: 'var(--danger)',
       borderColor: 'rgba(239, 68, 68, 0.45)',
       background: hovered ? 'rgba(239, 68, 68, 0.12)' : 'var(--panel)',
+    };
+  }
+
+  if (variant === 'active') {
+    return {
+      ...base,
+      background: 'var(--accent)',
+      borderColor: 'var(--accent)',
+      color: '#0a0a0a',
     };
   }
 
@@ -168,6 +179,36 @@ function CamIcon({ off }: { off: boolean }) {
   );
 }
 
+function ScreenShareIcon({ active }: { active: boolean }) {
+  return (
+    <svg
+      width={ICON_SIZE}
+      height={ICON_SIZE}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+      <line x1="8" y1="21" x2="16" y2="21" />
+      <line x1="12" y1="17" x2="12" y2="21" />
+      {active ? (
+        // галочка внутри монитора, когда активен
+        <polyline points="7 10 11 13 17 7" />
+      ) : (
+        // стрелка вверх — "транслировать"
+        <>
+          <line x1="12" y1="13" x2="12" y2="7" />
+          <polyline points="9 10 12 7 15 10" />
+        </>
+      )}
+    </svg>
+  );
+}
+
 function CopyIcon() {
   return (
     <svg
@@ -211,8 +252,10 @@ function PhoneDownIcon() {
 export default function Controls({
   micOn,
   camOn,
+  screenSharing,
   onToggleMic,
   onToggleCam,
+  onToggleScreenShare,
   onLeave,
   onCopyInvite,
 }: Props) {
@@ -234,6 +277,15 @@ export default function Controls({
         ariaLabel={camOn ? 'Выключить камеру' : 'Включить камеру'}
       >
         <CamIcon off={!camOn} />
+      </CircleButton>
+
+      <CircleButton
+        variant={screenSharing ? 'active' : 'default'}
+        onClick={onToggleScreenShare}
+        pressed={screenSharing}
+        ariaLabel={screenSharing ? 'Остановить трансляцию' : 'Транслировать экран'}
+      >
+        <ScreenShareIcon active={screenSharing} />
       </CircleButton>
 
       <CircleButton

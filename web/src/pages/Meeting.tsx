@@ -70,6 +70,13 @@ const inviteBtnStyle: CSSProperties = {
   cursor: 'pointer',
 };
 
+const resBadgeStyle: CSSProperties = {
+  fontSize: 11,
+  color: 'var(--muted)',
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  cursor: 'help',
+};
+
 const gridContainerStyle: CSSProperties = {
   flex: 1,
   minHeight: 0,
@@ -125,6 +132,31 @@ const errorBtnStyle: CSSProperties = {
   alignSelf: 'center',
 };
 
+const overlayStyle: CSSProperties = {
+  position: 'fixed',
+  inset: 0,
+  background: 'rgba(0, 0, 0, 0.7)',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  zIndex: 200,
+  pointerEvents: 'auto',
+};
+
+const overlayBoxStyle: CSSProperties = {
+  padding: '20px 28px',
+  background: 'var(--panel)',
+  border: '1px solid var(--border)',
+  borderRadius: 12,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 8,
+  alignItems: 'center',
+  fontSize: 14,
+  color: 'var(--fg)',
+  minWidth: 240,
+};
+
 interface ErrorStateProps {
   message: string;
   hint?: string;
@@ -146,37 +178,76 @@ function ErrorState({ message, hint, onBack }: ErrorStateProps) {
   );
 }
 
+const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
+const VIDEO_LADDER: MediaTrackConstraints[] = [
+  { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+  { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+  { width: { ideal: 854 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
+];
+
 /**
- * Пытаемся получить камеру+микрофон, при падении — fallback на только аудио.
+ * Пытаемся получить камеру+микрофон, спускаемся по лестнице 1080p→720p→480p,
+ * затем audio-only.
  */
 async function acquireMedia(): Promise<MediaStream> {
-  try {
-    return await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  } catch (err1) {
+  const errors: string[] = [];
+  for (const video of VIDEO_LADDER) {
     try {
-      return await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
-    } catch (err2) {
-      const msg2 = err2 instanceof Error ? err2.message : String(err2);
-      const msg1 = err1 instanceof Error ? err1.message : String(err1);
-      throw new Error(`getUserMedia: ${msg1} (audio-only fallback: ${msg2})`);
+      return await navigator.mediaDevices.getUserMedia({
+        video,
+        audio: AUDIO_CONSTRAINTS,
+      });
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err));
     }
   }
+  // Последний шанс — audio-only.
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      video: false,
+      audio: AUDIO_CONSTRAINTS,
+    });
+  } catch (err) {
+    const last = err instanceof Error ? err.message : String(err);
+    throw new Error(`getUserMedia: ${errors.join(' | ')} (audio-only: ${last})`);
+  }
+}
+
+function getVideoSize(stream: MediaStream | null): { w: number; h: number } | null {
+  if (!stream) return null;
+  const v = stream.getVideoTracks()[0];
+  if (!v) return null;
+  const settings = v.getSettings();
+  const w = typeof settings.width === 'number' ? settings.width : 0;
+  const h = typeof settings.height === 'number' ? settings.height : 0;
+  if (w === 0 || h === 0) return null;
+  return { w, h };
 }
 
 export default function Meeting({ roomId }: Props) {
   // localStream + peers + ui-флаги
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const [screenSharing, setScreenSharing] = useState<boolean>(false);
   const [peers, setPeers] = useState<Map<string, PeerEntry>>(() => new Map());
   const [micOn, setMicOn] = useState<boolean>(true);
   const [camOn, setCamOn] = useState<boolean>(true);
   const [stats, setStats] = useState<ConnectionStats | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [reconnecting, setReconnecting] = useState<boolean>(false);
+  const [reconnectAttempt, setReconnectAttempt] = useState<number>(0);
 
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
   const connectionRef = useRef<MeetConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const statsTimerRef = useRef<number | null>(null);
+  const recoveringRef = useRef<boolean>(false);
   // peerId → displayName (peer.id из welcome/peer-joined может НЕ совпадать со stream.id —
   // см. webrtc.ts: TODO mid→peerId mapping. Пока храним по обоим ключам как сможем.)
   const peerNamesRef = useRef<Map<string, string>>(new Map());
@@ -190,6 +261,81 @@ export default function Meeting({ roomId }: Props) {
       return '';
     }
   })();
+
+  // Recover camera/microphone после sleep/wake.
+  // Останавливаем старые треки, getUserMedia заново, replaceLocalTracks на publishPC.
+  const recoverMedia = async (): Promise<void> => {
+    if (recoveringRef.current) return;
+    recoveringRef.current = true;
+    try {
+      const oldStream = localStreamRef.current;
+      let newStream: MediaStream;
+      try {
+        newStream = await acquireMedia();
+      } catch (err) {
+        console.error('[Meeting] recoverMedia: acquireMedia failed', err);
+        return;
+      }
+      // Стопим старые треки только после того, как новый стрим успешно получен.
+      if (oldStream) {
+        for (const t of oldStream.getTracks()) {
+          try {
+            t.stop();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      // Применяем текущие mute-флаги к новому стриму.
+      for (const t of newStream.getAudioTracks()) {
+        t.enabled = micOn;
+      }
+      for (const t of newStream.getVideoTracks()) {
+        t.enabled = camOn;
+      }
+      // Подвешиваем listeners на новые треки.
+      attachTrackListeners(newStream);
+
+      localStreamRef.current = newStream;
+      setLocalStream(newStream);
+
+      const conn = connectionRef.current;
+      if (conn) {
+        try {
+          await conn.replaceLocalTracks(newStream);
+        } catch (err) {
+          console.error('[Meeting] recoverMedia: replaceLocalTracks failed', err);
+        }
+      }
+    } finally {
+      recoveringRef.current = false;
+    }
+  };
+
+  // Подвешивает listeners на 'ended'/'mute' для каждого track.
+  // Возвращает cleanup.
+  const attachTrackListeners = (stream: MediaStream): void => {
+    for (const t of stream.getTracks()) {
+      const onEnded = (): void => {
+        console.warn('[Meeting] track ended:', t.kind);
+        void recoverMedia();
+      };
+      const onMute = (): void => {
+        // Браузер пометил track как muted (например, экран заснул).
+        // Не сразу зовём recovery — даём шанс восстановиться (onunmute).
+        // Если через 1.5с всё ещё muted — recovery.
+        const k = t.kind;
+        window.setTimeout(() => {
+          if (t.muted && t.readyState !== 'ended') {
+            console.warn('[Meeting] track still muted after grace:', k);
+            void recoverMedia();
+          }
+        }, 1500);
+      };
+      t.addEventListener('ended', onEnded);
+      t.addEventListener('mute', onMute);
+    }
+  };
 
   // Главный lifecycle: одна setup-функция, один cleanup.
   useEffect(() => {
@@ -255,6 +401,7 @@ export default function Meeting({ roomId }: Props) {
       }
       localStreamRef.current = stream;
       setLocalStream(stream);
+      attachTrackListeners(stream);
 
       // 2. Сигналинг.
       const signal = new SignalClient(buildWsUrl(roomId, myName));
@@ -331,6 +478,35 @@ export default function Meeting({ roomId }: Props) {
         onError: (err: Error) => {
           // Логируем, но не валим UI: ошибки сигналинга/WebRTC могут быть некритичными.
           console.error('[Meeting]', err);
+          if (/signal disconnected/i.test(err.message)) {
+            setReconnecting(true);
+          }
+          if (/reconnect failed/i.test(err.message)) {
+            // Окончательно — показываем error-state.
+            setReconnecting(false);
+            setError(err.message);
+          }
+        },
+        onScreenShareStarted: () => {
+          // Уже выставили в handleToggleScreenShare; этот колбэк нужен на случай
+          // программного запуска screen share в будущем.
+        },
+        onScreenShareStopped: () => {
+          // Может прийти после reconnect или после browser "Stop sharing".
+          setScreenSharing(false);
+          setScreenStream(null);
+        },
+        onReconnecting: (attempt: number) => {
+          setReconnecting(true);
+          setReconnectAttempt(attempt);
+        },
+        onReconnected: () => {
+          setReconnecting(false);
+          setReconnectAttempt(0);
+          // После reconnect peers сбрасываются — старые удалятся через peer-left
+          // от сервера новой сессии не придёт, поэтому чистим вручную.
+          peerNamesRef.current.clear();
+          setPeers(new Map());
         },
       };
 
@@ -364,6 +540,26 @@ export default function Meeting({ roomId }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
+  // visibilitychange → если вкладка снова видна и треки сломаны, восстановить.
+  useEffect(() => {
+    const onVisibility = (): void => {
+      if (document.visibilityState !== 'visible') return;
+      const ls = localStreamRef.current;
+      if (!ls) return;
+      const broken = ls.getTracks().some(
+        (t) => t.readyState === 'ended' || t.muted,
+      );
+      if (broken) {
+        void recoverMedia();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleToggleMic = (): void => {
     const ls = localStreamRef.current;
     if (!ls) return;
@@ -382,6 +578,39 @@ export default function Meeting({ roomId }: Props) {
       t.enabled = enabled;
     }
     setCamOn(enabled);
+  };
+
+  const handleToggleScreenShare = (): void => {
+    const conn = connectionRef.current;
+    if (!conn) return;
+    if (screenSharing) {
+      void conn
+        .stopScreenShare()
+        .then(() => {
+          setScreenSharing(false);
+          setScreenStream(null);
+        })
+        .catch((err: unknown) => {
+          console.error('[Meeting] stopScreenShare failed', err);
+          setScreenSharing(false);
+          setScreenStream(null);
+        });
+    } else {
+      void conn
+        .startScreenShare()
+        .then((s) => {
+          setScreenStream(s);
+          setScreenSharing(true);
+        })
+        .catch((err: unknown) => {
+          // Юзер cancel'нул picker — DOMException NotAllowedError.
+          const name = err instanceof DOMException ? err.name : '';
+          if (name === 'NotAllowedError' || name === 'AbortError') {
+            return;
+          }
+          console.error('[Meeting] startScreenShare failed', err);
+        });
+    }
   };
 
   const handleLeave = (): void => {
@@ -469,6 +698,18 @@ export default function Meeting({ roomId }: Props) {
       camMuted: !camOn,
     });
   }
+
+  if (screenStream) {
+    const myDisplay = myName.trim().length > 0 ? myName : 'Вы';
+    tiles.push({
+      id: 'local-screen',
+      stream: screenStream,
+      name: `Экран: ${myDisplay}`,
+      // isLocal=true → VideoTile замьютит audio (ну и audio в screen у нас всё равно false).
+      isLocal: true,
+    });
+  }
+
   for (const [pid, entry] of peers) {
     tiles.push({
       id: pid,
@@ -477,6 +718,12 @@ export default function Meeting({ roomId }: Props) {
     });
   }
 
+  const size = getVideoSize(localStream);
+  const resTitle = size
+    ? `Локальное видео: ${size.w}×${size.h}`
+    : 'Локальное видео: только аудио';
+  const resBadge = size ? `${size.w}×${size.h}` : 'audio-only';
+
   return (
     <div style={pageStyle}>
       <div style={headerStyle}>
@@ -484,6 +731,9 @@ export default function Meeting({ roomId }: Props) {
           Мит <span style={roomIdStyle}>{roomId}</span>
         </h1>
         <ConnectionBadge stats={stats} />
+        <span style={resBadgeStyle} title={resTitle}>
+          {resBadge}
+        </span>
         <button type="button" style={inviteBtnStyle} onClick={handleCopyInvite}>
           Скопировать ссылку
         </button>
@@ -496,11 +746,26 @@ export default function Meeting({ roomId }: Props) {
       <Controls
         micOn={micOn}
         camOn={camOn}
+        screenSharing={screenSharing}
         onToggleMic={handleToggleMic}
         onToggleCam={handleToggleCam}
+        onToggleScreenShare={handleToggleScreenShare}
         onLeave={handleLeave}
         onCopyInvite={handleCopyInvite}
       />
+
+      {reconnecting && (
+        <div style={overlayStyle} role="alert" aria-live="assertive">
+          <div style={overlayBoxStyle}>
+            <div>Переподключение…</div>
+            {reconnectAttempt > 0 && (
+              <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+                Попытка {reconnectAttempt}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

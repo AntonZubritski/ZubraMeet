@@ -3,6 +3,7 @@ package sfu
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/AntonZubritski/ZubraMeet/internal/room"
@@ -114,10 +115,20 @@ func (s *SFU) handlePublishOffer(ps *peerState, sdp string) error {
 	if err != nil {
 		return fmt.Errorf("sfu: marshal publish-answer: %w", err)
 	}
-	return ps.send(signal.Envelope{
+	if err := ps.send(signal.Envelope{
 		Type: signal.MsgPublishAnswer,
 		Data: payload,
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Снимок числа треков под локом — на момент publish-answer часть треков
+	// уже могла прилететь через OnTrack (асинхронный callback Pion'а).
+	ps.mu.Lock()
+	numTracks := len(ps.published)
+	ps.mu.Unlock()
+	log.Printf("[sfu] publish-pc-ready client=%s tracks=%d", ps.clientID, numTracks)
+	return nil
 }
 
 // handleRemoteTrack — вызывается из publishPC.OnTrack каждый раз когда от
@@ -148,6 +159,9 @@ func (s *SFU) handleRemoteTrack(ps *peerState, remoteTrack *webrtc.TrackRemote) 
 	}
 	ps.published[pt.id] = pt
 	ps.mu.Unlock()
+
+	log.Printf("[sfu] track-published client=%s kind=%s id=%s ssrc=%d",
+		ps.clientID, remoteTrack.Kind(), remoteTrack.ID(), remoteTrack.SSRC())
 
 	// Запускаем форвардинг RTP-пакетов: remote → local.
 	go forwardRTP(remoteTrack, local, pt.done)
@@ -249,6 +263,9 @@ func (np *peerState) removeForwardedFrom(ownerID room.ClientID, trackIDs []strin
 	if len(tracks) == 0 {
 		delete(np.forwarded, ownerID)
 	}
+	if removed > 0 {
+		log.Printf("[sfu] track-unsubscribed client=%s from=%s removed=%d", np.clientID, ownerID, removed)
+	}
 	return removed
 }
 
@@ -260,6 +277,11 @@ func (np *peerState) renegotiateSubscribe() error {
 		return nil
 	}
 	pc := np.subscribePC
+	// Считаем сколько треков сейчас форвардится этому subscriber'у — для лога.
+	numTracks := 0
+	for _, byOwner := range np.forwarded {
+		numTracks += len(byOwner)
+	}
 	np.mu.Unlock()
 
 	offer, err := pc.CreateOffer(nil)
@@ -269,6 +291,8 @@ func (np *peerState) renegotiateSubscribe() error {
 	if err := pc.SetLocalDescription(offer); err != nil {
 		return fmt.Errorf("sfu: set local (subscribe-offer): %w", err)
 	}
+
+	log.Printf("[sfu] subscribe-renegotiate client=%s tracks=%d", np.clientID, numTracks)
 
 	payload, err := json.Marshal(sdpData{SDP: offer.SDP})
 	if err != nil {

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/AntonZubritski/ZubraMeet/internal/room"
@@ -116,6 +117,7 @@ func (s *SFU) OnPeerJoin(roomID string, clientID room.ClientID, send SendFn) {
 		published: make(map[string]*publishedTrack),
 		forwarded: make(map[room.ClientID]map[string]*webrtc.RTPSender),
 	}
+	log.Printf("[sfu] peer-join room=%s client=%s", roomID, clientID)
 }
 
 // OnPeerLeave закрывает все PC клиента и снимает его треки у соседей.
@@ -127,6 +129,7 @@ func (s *SFU) OnPeerLeave(roomID string, clientID room.ClientID) {
 		return
 	}
 	delete(s.peers, clientID)
+	log.Printf("[sfu] peer-leave room=%s client=%s", roomID, clientID)
 
 	// Соберём snapshot соседей (всё ещё в комнате) и закрываемые трек-IDs.
 	leavingTrackIDs := make([]string, 0, len(ps.published))

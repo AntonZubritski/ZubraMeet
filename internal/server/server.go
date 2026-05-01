@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -85,6 +86,7 @@ func New(cfg Config) *Server {
 // На отмене контекста — graceful shutdown с таймаутом 5s.
 func (s *Server) Run(ctx context.Context) error {
 	mux := s.routes()
+	log.Printf("[http] routes registered: GET /api/health, POST /api/rooms, GET /api/rooms/{id}, GET /ws, GET /*")
 
 	httpSrv := &http.Server{
 		Addr:    s.cfg.Addr,

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/AntonZubritski/ZubraMeet/internal/room"
 	"github.com/coder/websocket"
@@ -15,6 +17,10 @@ import (
 // sendBufSize — размер буфера на каждое WS-соединение. Если writer не успевает
 // слить очередь и буфер переполняется — клиент считается slow и закрывается.
 const sendBufSize = 32
+
+// roomGracePeriod — сколько ждать перед удалением пустой комнаты. За это время
+// клиент с разорваным WS (sleep, network blip) успевает реконнектнуться.
+const roomGracePeriod = 30 * time.Second
 
 // welcomeData — payload сообщения welcome.
 type welcomeData struct {
@@ -74,14 +80,58 @@ type Hub struct {
 
 	mu    sync.RWMutex
 	conns map[room.ClientID]*conn
+
+	// deleteMu защищает pendingDels. Отдельный мьютекс, чтобы AfterFunc-callback
+	// мог брать его не мешая обычному WS-трафику.
+	deleteMu    sync.Mutex
+	pendingDels map[string]*time.Timer
 }
 
 // NewHub конструирует пустой Hub. rooms и sfu — обязательны.
 func NewHub(rooms *room.Registry, sfu SFU) *Hub {
 	return &Hub{
-		rooms: rooms,
-		sfu:   sfu,
-		conns: make(map[room.ClientID]*conn),
+		rooms:       rooms,
+		sfu:         sfu,
+		conns:       make(map[room.ClientID]*conn),
+		pendingDels: make(map[string]*time.Timer),
+	}
+}
+
+// scheduleDelete планирует удаление пустой комнаты через roomGracePeriod.
+// Если для этой комнаты уже запланирован таймер — он сбрасывается и заводится новый.
+func (h *Hub) scheduleDelete(roomID string) {
+	h.deleteMu.Lock()
+	defer h.deleteMu.Unlock()
+
+	if existing, ok := h.pendingDels[roomID]; ok {
+		existing.Stop()
+	}
+	h.pendingDels[roomID] = time.AfterFunc(roomGracePeriod, func() {
+		h.deleteMu.Lock()
+		// Если за это время cancelDelete уже снял запись — значит таймер был
+		// отменён (или мы успели отстреляться раньше cancel). В любом случае
+		// нужно удалить нашу запись и идти проверять состояние комнаты.
+		delete(h.pendingDels, roomID)
+		h.deleteMu.Unlock()
+
+		// Финальная проверка под локом registry: комната всё ещё есть и пуста?
+		if r, ok := h.rooms.Get(roomID); ok && r.IsEmpty() {
+			h.rooms.Delete(roomID)
+			log.Printf("[room %s] grace expired — deleted", roomID)
+		}
+	})
+	log.Printf("[room %s] empty — scheduled delete in %s", roomID, roomGracePeriod)
+}
+
+// cancelDelete отменяет запланированное удаление комнаты, если оно есть.
+// Безопасно вызывать на любом Handle: если таймера нет — no-op.
+func (h *Hub) cancelDelete(roomID string) {
+	h.deleteMu.Lock()
+	defer h.deleteMu.Unlock()
+	if t, ok := h.pendingDels[roomID]; ok {
+		t.Stop()
+		delete(h.pendingDels, roomID)
+		log.Printf("[room %s] cancelled scheduled delete", roomID)
 	}
 }
 
@@ -96,6 +146,12 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "room not found", http.StatusNotFound)
 		return
 	}
+
+	// Если комната была "приговорена" к удалению — отменяем приговор.
+	// Делаем ДО Add, чтобы окно гонки с AfterFunc-callback'ом было минимальным:
+	// callback всё равно проверит IsEmpty() под локом registry, и Add ниже уже
+	// не даст комнате остаться пустой к моменту срабатывания.
+	h.cancelDelete(roomID)
 
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// dev-only: на проде origin-check будем добавлять отдельно.
@@ -138,12 +194,18 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request) {
 	// Writer-goroutine: один на соединение. Выходит когда sendCh закрыт.
 	go h.writeLoop(c)
 
+	// leaveErr — причина выхода из reader-loop'а; читается cleanup-defer'ом ниже
+	// для логирования. Объявляется до defer'а, чтобы замыкание видело его актуальное значение.
+	var leaveErr error
+
 	// Cleanup-defer: единая точка выхода из Handle. Порядок важен:
 	//  1) уведомить SFU чтобы он вычистил треки.
 	//  2) убрать клиента из room и сообщить остальным peer-left.
-	//  3) если room пуст — удалить из registry.
+	//  3) если room пуст — запланировать удаление через grace-period.
 	//  4) закрыть WS и удалить из hub.conns.
 	defer func() {
+		log.Printf("[ws] leave room=%s client=%s reason=%v", roomID, client.ID, leaveErr)
+
 		h.sfu.OnPeerLeave(roomID, client.ID)
 
 		roomObj.Remove(client.ID)
@@ -156,7 +218,7 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request) {
 		})
 
 		if roomObj.IsEmpty() {
-			h.rooms.Delete(roomID)
+			h.scheduleDelete(roomID)
 		}
 
 		h.mu.Lock()
@@ -203,10 +265,14 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 	h.sfu.OnPeerJoin(roomID, client.ID, sendFn)
 
+	log.Printf("[ws] join room=%s client=%s name=%q isHost=%v peers=%d",
+		roomID, client.ID, name, client.ID == roomObj.HostID(), len(peersBefore)+1)
+
 	// Reader-loop: блокируется на Read, выходит на любой ошибке/отмене ctx.
 	for {
 		_, msg, err := ws.Read(ctx)
 		if err != nil {
+			leaveErr = err
 			return
 		}
 

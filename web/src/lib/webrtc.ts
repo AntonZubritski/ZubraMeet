@@ -15,6 +15,10 @@ export interface MeetConnectionEvents {
   onPeerLeft(peerId: string): void;
   onConnectionState(state: RTCPeerConnectionState): void;
   onError(err: Error): void;
+  onScreenShareStarted?(stream: MediaStream): void;
+  onScreenShareStopped?(): void;
+  onReconnecting?(attempt: number): void;
+  onReconnected?(): void;
 }
 
 interface StatsSnapshot {
@@ -26,6 +30,9 @@ interface StatsSnapshot {
 }
 
 const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+const RECONNECT_MAX_ATTEMPTS = 5;
+const RECONNECT_BACKOFFS_MS = [1000, 2000, 4000, 8000, 8000];
 
 export class MeetConnection {
   private readonly signal: SignalClient;
@@ -41,6 +48,20 @@ export class MeetConnection {
   private readonly unsubscribers: Array<() => void> = [];
   private lastSnapshot: StatsSnapshot | null = null;
   private closed = false;
+
+  // Текущий локальный stream (камера+микрофон). Нужен для:
+  // - replaceLocalTracks (sleep/wake recovery)
+  // - перезапуска publishPC после reconnect.
+  private currentLocalStream: MediaStream | null = null;
+
+  // Скрин-стрим, если активен screen sharing.
+  private screenStream: MediaStream | null = null;
+  // Sender'ы для screen-треков на publishPC (чтобы removeTrack по ним).
+  private readonly screenSenders: Set<RTCRtpSender> = new Set();
+
+  // Reconnect state.
+  private reconnecting = false;
+  private offSignalClose: (() => void) | null = null;
 
   constructor(signal: SignalClient, events: MeetConnectionEvents, iceServers?: RTCIceServer[]) {
     this.signal = signal;
@@ -71,6 +92,19 @@ export class MeetConnection {
         void this.handleIce(env);
       }),
     );
+
+    // Слушаем close сигналинга → запускаем reconnect-процедуру.
+    this.offSignalClose = this.signal.onCloseEmitter((ev: CloseEvent) => {
+      if (this.closed) return;
+      // Уже идёт reconnect — игнорим (это close старого ws после reopen).
+      if (this.reconnecting) return;
+      try {
+        this.events.onError(new Error(`signal disconnected (code=${ev.code})`));
+      } catch {
+        /* ignore */
+      }
+      void this.runReconnectLoop();
+    });
   }
 
   get clientId(): string | null {
@@ -83,6 +117,7 @@ export class MeetConnection {
 
   async start(localStream: MediaStream): Promise<void> {
     try {
+      this.currentLocalStream = localStream;
       this.events.onLocalStream(localStream);
 
       const pc = new RTCPeerConnection({ iceServers: this.iceServers });
@@ -117,6 +152,138 @@ export class MeetConnection {
       this.signal.send<SDPData>('publish-offer', { sdp: offer.sdp ?? '' });
     } catch (err) {
       this.reportError(err, 'start');
+    }
+  }
+
+  /**
+   * Заменяет треки локального стрима на новые (того же kind) на существующих
+   * sender'ах publishPC. Используется после wake-from-sleep когда камера/микрофон
+   * "потерялись".
+   */
+  async replaceLocalTracks(stream: MediaStream): Promise<void> {
+    const pc = this.publishPC;
+    if (!pc) {
+      // Нет PC — просто запоминаем новый стрим.
+      this.currentLocalStream = stream;
+      return;
+    }
+
+    const senders = pc.getSenders();
+    const newTracks = stream.getTracks();
+
+    for (const track of newTracks) {
+      // Ищем sender, который раньше слал track такого же kind.
+      // Не учитываем screen-sender'ы — они для скрин-шеринга.
+      const sender = senders.find((s) => {
+        if (this.screenSenders.has(s)) return false;
+        return !!s.track && s.track.kind === track.kind;
+      });
+      if (!sender) {
+        // Нет соответствующего sender'а (например, был только аудио, а сейчас+видео) —
+        // молча пропускаем; полная renegotiation для MVP не делаем.
+        continue;
+      }
+      try {
+        await sender.replaceTrack(track);
+      } catch (err) {
+        this.reportError(err, `replaceTrack(${track.kind})`);
+      }
+    }
+
+    this.currentLocalStream = stream;
+  }
+
+  // ─── screen sharing ────────────────────────────────────────────────────────
+
+  async startScreenShare(): Promise<MediaStream> {
+    if (this.screenStream) {
+      return this.screenStream;
+    }
+    const pc = this.publishPC;
+    if (!pc) {
+      throw new Error('startScreenShare: publishPC not ready');
+    }
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30 } },
+      audio: false,
+    });
+
+    // Запоминаем до renegotiate, чтобы отслеживать onended даже если SDP-обмен фейлит.
+    this.screenStream = stream;
+
+    for (const track of stream.getTracks()) {
+      const transceiver = pc.addTransceiver(track, {
+        direction: 'sendonly',
+        streams: [stream],
+      });
+      this.screenSenders.add(transceiver.sender);
+      // Если пользователь нажал "Stop sharing" в браузерном UI — стопим сами.
+      track.onended = () => {
+        // Чтобы не перевызвать stop рекурсивно, защищаемся проверкой.
+        if (this.screenStream === stream) {
+          void this.stopScreenShare();
+        }
+      };
+    }
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      this.signal.send<SDPData>('publish-offer', { sdp: offer.sdp ?? '' });
+    } catch (err) {
+      this.reportError(err, 'startScreenShare renegotiate');
+    }
+
+    try {
+      this.events.onScreenShareStarted?.(stream);
+    } catch (err) {
+      this.reportError(err, 'onScreenShareStarted');
+    }
+
+    return stream;
+  }
+
+  async stopScreenShare(): Promise<void> {
+    const stream = this.screenStream;
+    const pc = this.publishPC;
+    if (!stream) return;
+
+    // Снимаем senders, останавливаем треки.
+    if (pc) {
+      for (const sender of this.screenSenders) {
+        try {
+          pc.removeTrack(sender);
+        } catch (err) {
+          this.reportError(err, 'stopScreenShare removeTrack');
+        }
+      }
+    }
+    this.screenSenders.clear();
+
+    for (const track of stream.getTracks()) {
+      try {
+        track.onended = null;
+        track.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.screenStream = null;
+
+    if (pc) {
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        this.signal.send<SDPData>('publish-offer', { sdp: offer.sdp ?? '' });
+      } catch (err) {
+        this.reportError(err, 'stopScreenShare renegotiate');
+      }
+    }
+
+    try {
+      this.events.onScreenShareStopped?.();
+    } catch (err) {
+      this.reportError(err, 'onScreenShareStopped');
     }
   }
 
@@ -223,6 +390,15 @@ export class MeetConnection {
     if (this.closed) return;
     this.closed = true;
 
+    if (this.offSignalClose) {
+      try {
+        this.offSignalClose();
+      } catch {
+        /* ignore */
+      }
+      this.offSignalClose = null;
+    }
+
     for (const off of this.unsubscribers) {
       try {
         off();
@@ -248,7 +424,113 @@ export class MeetConnection {
       }
       this.subscribePC = null;
     }
+
+    // Стопим только screen-стрим (мы его создали). localStream — caller's.
+    if (this.screenStream) {
+      for (const t of this.screenStream.getTracks()) {
+        try {
+          t.onended = null;
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.screenStream = null;
+    }
+    this.screenSenders.clear();
     // NOTE: do not stop localStream tracks — caller owns the stream.
+  }
+
+  // ─── reconnect ─────────────────────────────────────────────────────────────
+
+  private async runReconnectLoop(): Promise<void> {
+    if (this.closed || this.reconnecting) return;
+    this.reconnecting = true;
+
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt++) {
+      if (this.closed) {
+        this.reconnecting = false;
+        return;
+      }
+      try {
+        this.events.onReconnecting?.(attempt);
+      } catch {
+        /* ignore */
+      }
+      const delay = RECONNECT_BACKOFFS_MS[attempt - 1] ?? 8000;
+      await sleep(delay);
+      if (this.closed) {
+        this.reconnecting = false;
+        return;
+      }
+      try {
+        await this.signal.reconnect();
+        // Signal снова открыт. Пересоздаём PC и заново шлём publish-offer.
+        this.rebuildPeerConnections();
+        const stream = this.currentLocalStream;
+        if (stream) {
+          // Не трогаем currentLocalStream — start выставит его сам.
+          await this.start(stream);
+        }
+        this.reconnecting = false;
+        try {
+          this.events.onReconnected?.();
+        } catch {
+          /* ignore */
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        // Continue.
+      }
+    }
+
+    this.reconnecting = false;
+    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr ?? 'unknown');
+    this.reportError(new Error(`reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts: ${msg}`), 'reconnect');
+  }
+
+  private rebuildPeerConnections(): void {
+    if (this.publishPC) {
+      try {
+        this.publishPC.close();
+      } catch {
+        /* ignore */
+      }
+      this.publishPC = null;
+    }
+    if (this.subscribePC) {
+      try {
+        this.subscribePC.close();
+      } catch {
+        /* ignore */
+      }
+      this.subscribePC = null;
+    }
+    // Скрин-сендеры были привязаны к старому PC — они невалидны.
+    this.screenSenders.clear();
+    // Скрин-стрим тоже сбрасываем — после reconnect screen sharing нужно начинать заново.
+    if (this.screenStream) {
+      for (const t of this.screenStream.getTracks()) {
+        try {
+          t.onended = null;
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.screenStream = null;
+      try {
+        this.events.onScreenShareStopped?.();
+      } catch {
+        /* ignore */
+      }
+    }
+    // clientId сбросим — сервер выдаст новый при welcome.
+    this._clientId = null;
+    this._isHost = false;
+    this.lastSnapshot = null;
   }
 
   // ─── handlers ──────────────────────────────────────────────────────────────
@@ -374,4 +656,10 @@ export class MeetConnection {
       /* swallow */
     }
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
