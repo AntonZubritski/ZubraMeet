@@ -8,7 +8,13 @@ import {
 import { navigate } from '../App';
 import { SignalClient, buildWsUrl } from '../lib/signal';
 import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
-import type { ConnectionStats, PeerInfo } from '../types';
+import type {
+  ConnectionStats,
+  ConnectivityResp,
+  Endpoint,
+  EndpointKind,
+  PeerInfo,
+} from '../types';
 import VideoGrid from '../components/VideoGrid';
 import Controls from '../components/Controls';
 import ConnectionBadge from '../components/ConnectionBadge';
@@ -218,6 +224,12 @@ async function acquireMedia(): Promise<MediaStream> {
   }
 }
 
+const ENDPOINT_KIND_META: Record<EndpointKind, { icon: string; label: string }> = {
+  local: { icon: '📡', label: 'Локально' },
+  lan: { icon: '🏠', label: 'LAN' },
+  internet: { icon: '🌍', label: 'Интернет' },
+};
+
 function getVideoSize(stream: MediaStream | null): { w: number; h: number } | null {
   if (!stream) return null;
   const v = stream.getVideoTracks()[0];
@@ -241,6 +253,10 @@ export default function Meeting({ roomId }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState<boolean>(false);
   const [reconnectAttempt, setReconnectAttempt] = useState<number>(0);
+  // Share-panel state (host-only — гости получат 403 и панель не отрисуется).
+  const [endpoints, setEndpoints] = useState<Endpoint[] | null>(null);
+  const [endpointsErr, setEndpointsErr] = useState<string | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
@@ -560,6 +576,52 @@ export default function Meeting({ roomId }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Fetch connectivity options. Only хост (с localhost) получит 200; гости — 403.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/connectivity')
+      .then(async (r) => {
+        if (r.status === 403) {
+          // Гость — silently skip, панель показывать не надо.
+          return null;
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return (await r.json()) as ConnectivityResp;
+      })
+      .then((d) => {
+        if (!cancelled && d) setEndpoints(d.endpoints);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        setEndpointsErr(msg);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleCopyEndpoint = (key: string, url: string): void => {
+    const fullUrl = `${url}/m/${roomId}`;
+    const onCopied = (): void => {
+      setCopiedKey(key);
+      window.setTimeout(() => {
+        setCopiedKey((cur) => (cur === key ? null : cur));
+      }, 1500);
+    };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      void navigator.clipboard
+        .writeText(fullUrl)
+        .then(onCopied)
+        .catch((err: unknown) => {
+          console.error('[Meeting] clipboard write failed', err);
+        });
+    } else {
+      console.log('[Meeting] copy fallback:', fullUrl);
+      onCopied();
+    }
+  };
+
   const handleToggleMic = (): void => {
     const ls = localStreamRef.current;
     if (!ls) return;
@@ -724,6 +786,11 @@ export default function Meeting({ roomId }: Props) {
     : 'Локальное видео: только аудио';
   const resBadge = size ? `${size.w}×${size.h}` : 'audio-only';
 
+  // Подготовка строк для share-panel (только если endpoints получены).
+  const showSharePanel = endpoints !== null;
+  const hasInternet =
+    endpoints !== null && endpoints.some((e) => e.kind === 'internet');
+
   return (
     <div style={pageStyle}>
       <div style={headerStyle}>
@@ -738,6 +805,61 @@ export default function Meeting({ roomId }: Props) {
           Скопировать ссылку
         </button>
       </div>
+
+      {showSharePanel && (
+        <div style={{ padding: '10px 16px', flexShrink: 0 }}>
+          <div className="share-panel">
+            <div className="share-panel-title">🔗 Поделиться</div>
+            {endpoints!.map((ep, idx) => {
+              const key = `${ep.kind}-${ep.host}-${ep.port}-${idx}`;
+              const meta = ENDPOINT_KIND_META[ep.kind];
+              const fullUrl = `${ep.url}/m/${roomId}`;
+              const isCopied = copiedKey === key;
+              return (
+                <div key={key} className="share-row">
+                  <span className="share-row-label">
+                    <span aria-hidden="true">{meta.icon}</span>
+                    <span>{meta.label}</span>
+                  </span>
+                  <span className="share-row-url" title={fullUrl}>
+                    {fullUrl}
+                  </span>
+                  <button
+                    type="button"
+                    className={`share-row-copy${isCopied ? ' copied' : ''}`}
+                    onClick={() => handleCopyEndpoint(key, ep.url)}
+                  >
+                    {isCopied ? '✓ Скопировано' : 'copy'}
+                  </button>
+                </div>
+              );
+            })}
+            {!hasInternet && (
+              <div
+                className="share-row"
+                style={{ color: 'var(--muted)', fontSize: 12 }}
+              >
+                <span aria-hidden="true" style={{ marginRight: 6 }}>🌍</span>
+                UPnP не сработал — попроси гостей быть в твоей Wi-Fi или открой
+                7443 на роутере вручную
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {!showSharePanel && endpointsErr && (
+        <div
+          style={{
+            padding: '10px 16px',
+            color: 'var(--muted)',
+            fontSize: 12,
+            flexShrink: 0,
+          }}
+        >
+          Не удалось получить варианты подключения ({endpointsErr})
+        </div>
+      )}
 
       <div style={gridContainerStyle}>
         <VideoGrid tiles={tiles} />

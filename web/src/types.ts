@@ -55,3 +55,17 @@ export interface ConnectionStats {
   rttMs: number;
   packetLossPct: number;
 }
+
+export type EndpointKind = 'local' | 'lan' | 'internet';
+
+export interface Endpoint {
+  kind: EndpointKind;
+  host: string;
+  port: number;
+  scheme: 'http' | 'https';
+  url: string;
+}
+
+export interface ConnectivityResp {
+  endpoints: Endpoint[];
+}

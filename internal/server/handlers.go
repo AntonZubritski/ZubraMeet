@@ -2,7 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
+	"strconv"
+
+	"github.com/AntonZubritski/ZubraMeet/internal/connectivity"
 )
 
 // healthResponse — payload для GET /api/health.
@@ -94,6 +98,61 @@ func (s *Server) handleGetRoom(w http.ResponseWriter, r *http.Request) {
 		HostID: string(rm.HostID()),
 		Peers:  peers,
 	})
+}
+
+// connectivityResponse — payload для GET /api/connectivity.
+type connectivityResponse struct {
+	Endpoints []connectivity.Endpoint `json:"endpoints"`
+}
+
+// handleConnectivity отдаёт список адресов, по которым достижим сервер
+// (localhost, LAN-IPs, public IP). Используется хост-приложением для
+// формирования invite-ссылок.
+//
+// SECURITY: эндпойнт раскрывает локальную топологию (LAN-IP), поэтому
+// доступен только loopback-клиентам. Удалённые гости получат 403.
+func (s *Server) handleConnectivity(w http.ResponseWriter, r *http.Request) {
+	if !isLocalRequest(r) {
+		writeJSON(w, http.StatusForbidden, errorResponse{Error: "forbidden"})
+		return
+	}
+
+	httpPort := portFromAddr(s.cfg.HTTPAddr)
+	httpsPort := portFromAddr(s.cfg.HTTPSAddr)
+
+	endpoints, err := connectivity.Discover(r.Context(), httpPort, httpsPort, s.publicIP)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, connectivityResponse{Endpoints: endpoints})
+}
+
+// portFromAddr извлекает числовой порт из адреса вида ":7443" / "0.0.0.0:7443".
+// При ошибке парсинга возвращает 0 — это лучше, чем падать в handler'е, потому
+// что Run() уже валидировал адреса на старте.
+func portFromAddr(addr string) uint16 {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return 0
+	}
+	return uint16(p)
+}
+
+// isLocalRequest возвращает true, если запрос пришёл с loopback-адреса
+// (127.0.0.1 / ::1). Используется для защиты sensitive-эндпойнтов.
+func isLocalRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // writeJSON — обёртка для отправки JSON-ответа с явным Content-Type и статусом.

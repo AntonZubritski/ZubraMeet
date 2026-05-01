@@ -15,7 +15,9 @@ import (
 const Version = "0.1.0-dev"
 
 func main() {
-	addr := flag.String("addr", ":7777", "HTTP listen address")
+	httpAddr := flag.String("http", ":7777", "HTTP listen address (localhost only)")
+	httpsAddr := flag.String("https", ":7443", "HTTPS listen address (for guests)")
+	upnp := flag.Bool("upnp", true, "Enable UPnP port mapping for internet access")
 	flag.Parse()
 
 	staticFS, err := fs.Sub(webDist, "web/dist")
@@ -24,16 +26,18 @@ func main() {
 	}
 
 	srv := server.New(server.Config{
-		Addr:     *addr,
-		Version:  Version,
-		StaticFS: staticFS,
+		HTTPAddr:   *httpAddr,
+		HTTPSAddr:  *httpsAddr,
+		Version:    Version,
+		StaticFS:   staticFS,
+		EnableUPnP: *upnp,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		log.Printf("ZubraMeet %s — listening on %s", Version, *addr)
+		log.Printf("ZubraMeet %s — HTTP %s, HTTPS %s, UPnP=%v", Version, *httpAddr, *httpsAddr, *upnp)
 		if err := srv.Run(ctx); err != nil {
 			log.Fatalf("server: %v", err)
 		}

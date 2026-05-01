@@ -12,6 +12,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET /api/connectivity", s.handleConnectivity)
 	mux.HandleFunc("POST /api/rooms", s.handleCreateRoom)
 	mux.HandleFunc("GET /api/rooms/{id}", s.handleGetRoom)
 
