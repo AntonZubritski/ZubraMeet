@@ -67,6 +67,10 @@ type Server struct {
 	natClient  *nat.Client  // nil если UPnP не сработал
 	natMapping *nat.Mapping // nil если mapping не создан
 	publicIP   string       // "" если не определён
+
+	// diagnosis — результат авто-диагностики reachability сервера из интернета.
+	// Заполняется в Run() после tryUPnP. Читается /api/connectivity.
+	diagnosis connectivity.Diagnosis
 }
 
 // defaultSTUN возвращает дефолтный список ICE-серверов. Используется когда
@@ -132,6 +136,17 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.cfg.EnableUPnP {
 		s.tryUPnP(ctx, httpsPort, &hosts)
 	}
+
+	// 3a. Авто-диагностика reachability из интернета. Использует уже
+	// известный s.publicIP (если UPnP сработал) и сам пробует найти
+	// глобальный IPv6. Чисто read-only: ни на что в Run не влияет, кроме
+	// того, что результат отдаётся клиентам через /api/connectivity.
+	d := connectivity.Diagnose(s.publicIP)
+	s.mu.Lock()
+	s.diagnosis = d
+	s.mu.Unlock()
+	log.Printf("[net] diagnosis: status=%s ipv4=%q ipv6=%q cgnat=%v reasons=%v",
+		d.Status, d.PublicIPv4, d.PublicIPv6, d.BehindCGNAT, d.Reasons)
 
 	// 4. TLS cert. Если падает — HTTPS отключён, продолжаем на HTTP.
 	var tlsCert *tls.Certificate

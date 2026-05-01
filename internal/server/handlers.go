@@ -100,17 +100,14 @@ func (s *Server) handleGetRoom(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// connectivityResponse — payload для GET /api/connectivity.
-type connectivityResponse struct {
-	Endpoints []connectivity.Endpoint `json:"endpoints"`
-}
-
 // handleConnectivity отдаёт список адресов, по которым достижим сервер
-// (localhost, LAN-IPs, public IP). Используется хост-приложением для
-// формирования invite-ссылок.
+// (localhost, LAN-IPs, public IP), вместе с результатом авто-диагностики
+// reachability (CGNAT, отсутствие IPv6 и т.п.). Используется хост-приложением
+// для формирования invite-ссылок и UI-предупреждений.
 //
-// SECURITY: эндпойнт раскрывает локальную топологию (LAN-IP), поэтому
-// доступен только loopback-клиентам. Удалённые гости получат 403.
+// SECURITY: эндпойнт раскрывает локальную топологию (LAN-IP) и детали
+// сетевой видимости, поэтому доступен только loopback-клиентам. Удалённые
+// гости получат 403.
 func (s *Server) handleConnectivity(w http.ResponseWriter, r *http.Request) {
 	if !isLocalRequest(r) {
 		writeJSON(w, http.StatusForbidden, errorResponse{Error: "forbidden"})
@@ -126,7 +123,14 @@ func (s *Server) handleConnectivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, connectivityResponse{Endpoints: endpoints})
+	s.mu.Lock()
+	diag := s.diagnosis
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"endpoints": endpoints,
+		"diagnosis": diag,
+	})
 }
 
 // portFromAddr извлекает числовой порт из адреса вида ":7443" / "0.0.0.0:7443".

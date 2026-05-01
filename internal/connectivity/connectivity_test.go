@@ -34,29 +34,37 @@ func TestDiscoverShape(t *testing.T) {
 		t.Errorf("local URL = %q, want http://localhost:7777", first.URL)
 	}
 
-	// Last must be the Internet endpoint we asked for.
-	last := eps[len(eps)-1]
-	if last.Kind != KindInternet {
-		t.Fatalf("last endpoint kind = %q, want %q (eps=%+v)", last.Kind, KindInternet, eps)
+	// Среди endpoints обязан быть IPv4 internet endpoint, который мы заказали.
+	// Хост может также добавить IPv6 internet endpoint (зависит от сети) —
+	// поэтому ищем по host, а не по индексу.
+	var internetV4 *Endpoint
+	for i := range eps {
+		ep := eps[i]
+		if ep.Kind == KindInternet && ep.Host == "1.2.3.4" {
+			internetV4 = &eps[i]
+			break
+		}
 	}
-	if last.Host != "1.2.3.4" {
-		t.Errorf("internet host = %q, want 1.2.3.4", last.Host)
+	if internetV4 == nil {
+		t.Fatalf("expected Internet endpoint with host 1.2.3.4, got eps=%+v", eps)
 	}
-	if last.Port != 7443 {
-		t.Errorf("internet port = %d, want 7443", last.Port)
+	if internetV4.Port != 7443 {
+		t.Errorf("internet port = %d, want 7443", internetV4.Port)
 	}
-	if last.Scheme != "https" {
-		t.Errorf("internet scheme = %q, want https", last.Scheme)
+	if internetV4.Scheme != "https" {
+		t.Errorf("internet scheme = %q, want https", internetV4.Scheme)
 	}
-	if last.URL != "https://1.2.3.4:7443" {
-		t.Errorf("internet URL = %q, want https://1.2.3.4:7443", last.URL)
+	if internetV4.URL != "https://1.2.3.4:7443" {
+		t.Errorf("internet URL = %q, want https://1.2.3.4:7443", internetV4.URL)
+	}
+	if internetV4.Family != "ipv4" {
+		t.Errorf("internet family = %q, want ipv4", internetV4.Family)
 	}
 
-	// Any middle endpoints must be LAN with https + httpsPort.
-	for i := 1; i < len(eps)-1; i++ {
-		ep := eps[i]
+	// Все LAN endpoints — https + httpsPort + family=ipv4.
+	for i, ep := range eps {
 		if ep.Kind != KindLAN {
-			t.Errorf("eps[%d].Kind = %q, want %q", i, ep.Kind, KindLAN)
+			continue
 		}
 		if ep.Scheme != "https" {
 			t.Errorf("eps[%d].Scheme = %q, want https", i, ep.Scheme)
@@ -66,6 +74,21 @@ func TestDiscoverShape(t *testing.T) {
 		}
 		if ep.URL == "" || ep.Host == "" {
 			t.Errorf("eps[%d] missing URL/Host: %+v", i, ep)
+		}
+		if ep.Family != "ipv4" {
+			t.Errorf("eps[%d].Family = %q, want ipv4", i, ep.Family)
+		}
+	}
+
+	// Если есть IPv6 internet endpoint — URL должен быть с квадратными
+	// скобками вокруг адреса.
+	for _, ep := range eps {
+		if ep.Kind != KindInternet || ep.Family != "ipv6" {
+			continue
+		}
+		want := "https://[" + ep.Host + "]:7443"
+		if ep.URL != want {
+			t.Errorf("ipv6 internet URL = %q, want %q", ep.URL, want)
 		}
 	}
 }
@@ -79,9 +102,11 @@ func TestDiscoverNoPublic(t *testing.T) {
 	if len(eps) == 0 {
 		t.Fatalf("expected at least the Local endpoint")
 	}
+	// Если publicIP пустой, IPv4 internet endpoint появляться не должен.
+	// IPv6 internet endpoint допускается (зависит от хоста).
 	for _, ep := range eps {
-		if ep.Kind == KindInternet {
-			t.Errorf("unexpected Internet endpoint when publicIP is empty: %+v", ep)
+		if ep.Kind == KindInternet && ep.Family == "ipv4" {
+			t.Errorf("unexpected IPv4 Internet endpoint when publicIP is empty: %+v", ep)
 		}
 	}
 	if eps[0].Kind != KindLocal {

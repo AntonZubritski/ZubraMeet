@@ -24,10 +24,11 @@ const (
 // Endpoint describes one reachable address for the server.
 type Endpoint struct {
 	Kind   Kind   `json:"kind"`
-	Host   string `json:"host"`   // "localhost", "192.168.1.42", "203.0.113.5"
-	Port   uint16 `json:"port"`   // e.g. 7777 for http, 7443 for https
-	Scheme string `json:"scheme"` // "http" or "https"
-	URL    string `json:"url"`    // full URL: "https://192.168.1.42:7443"
+	Host   string `json:"host"`             // "localhost", "192.168.1.42", "203.0.113.5", "2001:db8::1"
+	Port   uint16 `json:"port"`             // e.g. 7777 for http, 7443 for https
+	Scheme string `json:"scheme"`           // "http" or "https"
+	URL    string `json:"url"`              // full URL: "https://192.168.1.42:7443" / "https://[2001:db8::1]:7443"
+	Family string `json:"family,omitempty"` // "ipv4" / "ipv6"; omitempty для local
 }
 
 // Discover returns all endpoints by which the server can be reached.
@@ -69,17 +70,37 @@ func Discover(ctx context.Context, httpPort, httpsPort uint16, publicIP string) 
 			Port:   httpsPort,
 			Scheme: "https",
 			URL:    fmt.Sprintf("https://%s:%d", ip, httpsPort),
+			Family: "ipv4",
 		})
 	}
 
-	// 3. Internet — only if we know our public IP.
-	if publicIP != "" {
+	// 3. Internet IPv4 — only if we know our public IP AND it is actually
+	// public (not RFC1918 / CGNAT). UPnP can return the LAN-side address of
+	// the upstream router when behind CGNAT — that endpoint is unreachable
+	// from the outside, so we hide it. Diagnosis still flags this case.
+	if publicIP != "" && !IsPrivateOrCGNAT(net.ParseIP(publicIP)) {
 		endpoints = append(endpoints, Endpoint{
 			Kind:   KindInternet,
 			Host:   publicIP,
 			Port:   httpsPort,
 			Scheme: "https",
 			URL:    fmt.Sprintf("https://%s:%d", publicIP, httpsPort),
+			Family: "ipv4",
+		})
+	}
+
+	// 4. Internet IPv6 — если на хосте есть глобальный IPv6, он публичный
+	// по дизайну (без NAT). Квадратные скобки в URL обязательны.
+	// Ошибку enumeration интерфейсов не считаем фатальной — IPv4 путь уже
+	// собрали выше.
+	if v6, _ := PublicIPv6(); v6 != "" {
+		endpoints = append(endpoints, Endpoint{
+			Kind:   KindInternet,
+			Host:   v6,
+			Port:   httpsPort,
+			Scheme: "https",
+			URL:    fmt.Sprintf("https://[%s]:%d", v6, httpsPort),
+			Family: "ipv6",
 		})
 	}
 

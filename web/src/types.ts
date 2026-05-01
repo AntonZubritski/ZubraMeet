@@ -64,8 +64,27 @@ export interface Endpoint {
   port: number;
   scheme: 'http' | 'https';
   url: string;
+  family?: 'ipv4' | 'ipv6';
+}
+
+export type ReachabilityStatus = 'ok' | 'lan-only' | 'behind-cgnat';
+
+export type ReachabilityReason =
+  | 'cgnat-detected'
+  | 'no-ipv6'
+  | 'no-upnp'
+  | 'upnp-private-ip';
+
+export interface Diagnosis {
+  status: ReachabilityStatus;
+  publicIPv4: string; // "" если нет
+  publicIPv6: string; // "" если нет
+  upnpWorked: boolean;
+  behindCGNAT: boolean;
+  reasons: ReachabilityReason[];
 }
 
 export interface ConnectivityResp {
   endpoints: Endpoint[];
+  diagnosis: Diagnosis;
 }

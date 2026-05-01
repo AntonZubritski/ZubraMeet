@@ -11,6 +11,7 @@ import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
 import type {
   ConnectionStats,
   ConnectivityResp,
+  Diagnosis,
   Endpoint,
   EndpointKind,
   PeerInfo,
@@ -255,8 +256,11 @@ export default function Meeting({ roomId }: Props) {
   const [reconnectAttempt, setReconnectAttempt] = useState<number>(0);
   // Share-panel state (host-only — гости получат 403 и панель не отрисуется).
   const [endpoints, setEndpoints] = useState<Endpoint[] | null>(null);
+  const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [endpointsErr, setEndpointsErr] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [showAdvice, setShowAdvice] = useState<boolean>(false);
+  const [rechecking, setRechecking] = useState<boolean>(false);
 
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
@@ -589,7 +593,11 @@ export default function Meeting({ roomId }: Props) {
         return (await r.json()) as ConnectivityResp;
       })
       .then((d) => {
-        if (!cancelled && d) setEndpoints(d.endpoints);
+        if (!cancelled && d) {
+          setEndpoints(d.endpoints);
+          // graceful: старый сервер мог не присылать diagnosis
+          setDiagnosis(d.diagnosis ?? null);
+        }
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -600,6 +608,31 @@ export default function Meeting({ roomId }: Props) {
       cancelled = true;
     };
   }, []);
+
+  const handleRecheck = (): void => {
+    if (rechecking) return;
+    setRechecking(true);
+    setEndpointsErr(null);
+    fetch('/api/connectivity')
+      .then(async (r) => {
+        if (r.status === 403) return null;
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return (await r.json()) as ConnectivityResp;
+      })
+      .then((d) => {
+        if (d) {
+          setEndpoints(d.endpoints);
+          setDiagnosis(d.diagnosis ?? null);
+        }
+      })
+      .catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        setEndpointsErr(msg);
+      })
+      .finally(() => {
+        setRechecking(false);
+      });
+  };
 
   const handleCopyEndpoint = (key: string, url: string): void => {
     const fullUrl = `${url}/m/${roomId}`;
@@ -788,8 +821,8 @@ export default function Meeting({ roomId }: Props) {
 
   // Подготовка строк для share-panel (только если endpoints получены).
   const showSharePanel = endpoints !== null;
-  const hasInternet =
-    endpoints !== null && endpoints.some((e) => e.kind === 'internet');
+  const hasIPv6 =
+    diagnosis !== null && diagnosis.publicIPv6.length > 0;
 
   return (
     <div style={pageStyle}>
@@ -815,11 +848,20 @@ export default function Meeting({ roomId }: Props) {
               const meta = ENDPOINT_KIND_META[ep.kind];
               const fullUrl = `${ep.url}/m/${roomId}`;
               const isCopied = copiedKey === key;
+              // Для internet-эндпойнтов уточняем семейство IP в лейбле,
+              // т.к. их теперь может быть до двух (ipv4 + ipv6).
+              const familySuffix =
+                ep.kind === 'internet' && ep.family
+                  ? ep.family === 'ipv4'
+                    ? ' (IPv4)'
+                    : ' (IPv6)'
+                  : '';
+              const label = `${meta.label}${familySuffix}`;
               return (
                 <div key={key} className="share-row">
                   <span className="share-row-label">
                     <span aria-hidden="true">{meta.icon}</span>
-                    <span>{meta.label}</span>
+                    <span>{label}</span>
                   </span>
                   <span className="share-row-url" title={fullUrl}>
                     {fullUrl}
@@ -834,17 +876,120 @@ export default function Meeting({ roomId }: Props) {
                 </div>
               );
             })}
-            {!hasInternet && (
-              <div
-                className="share-row"
-                style={{ color: 'var(--muted)', fontSize: 12 }}
-              >
-                <span aria-hidden="true" style={{ marginRight: 6 }}>🌍</span>
-                UPnP не сработал — попроси гостей быть в твоей Wi-Fi или открой
-                7443 на роутере вручную
+          </div>
+
+          {diagnosis && diagnosis.status === 'lan-only' && (
+            <div className="diagnosis-banner lan-only">
+              <div className="diagnosis-banner-row">
+                <span>
+                  <span aria-hidden="true">ℹ️ </span>
+                  Интернет недоступен — работает только локально и в твоей Wi-Fi
+                </span>
+                <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    className="diagnosis-recheck"
+                    onClick={handleRecheck}
+                    disabled={rechecking}
+                  >
+                    {rechecking ? 'Проверяю…' : 'Перепроверить'}
+                  </button>
+                  <button
+                    type="button"
+                    className="diagnosis-banner-toggle"
+                    onClick={() => setShowAdvice((v) => !v)}
+                  >
+                    {showAdvice ? 'Скрыть ▲' : 'Как открыть для интернета? ▼'}
+                  </button>
+                </span>
+              </div>
+              {showAdvice && (
+                <div className="diagnosis-banner-advice">
+                  <ul>
+                    <li>
+                      UPnP не сработал — возможно отключён на роутере. Включи
+                      UPnP в админке роутера и перезапусти ZubraMeet.
+                    </li>
+                    <li>
+                      Или вручную пробрось порт 7443/TCP на роутере на
+                      ip-вашего-компа.
+                    </li>
+                    <li>
+                      Или используй mesh-VPN (Tailscale, ZeroTier) чтобы гости
+                      были в твоей виртуальной сети.
+                    </li>
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {diagnosis && diagnosis.status === 'behind-cgnat' && (
+            <div className="diagnosis-banner behind-cgnat">
+              <div className="diagnosis-banner-row">
+                <span>
+                  <span aria-hidden="true">⚠️ </span>
+                  Ты за CGNAT провайдера — гости из интернета не подключатся
+                  напрямую
+                </span>
+                <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    className="diagnosis-recheck"
+                    onClick={handleRecheck}
+                    disabled={rechecking}
+                  >
+                    {rechecking ? 'Проверяю…' : 'Перепроверить'}
+                  </button>
+                  <button
+                    type="button"
+                    className="diagnosis-banner-toggle"
+                    onClick={() => setShowAdvice((v) => !v)}
+                  >
+                    {showAdvice ? 'Скрыть ▲' : 'Что делать? ▼'}
+                  </button>
+                </span>
+              </div>
+              {showAdvice && (
+                <div className="diagnosis-banner-advice">
+                  <div>
+                    CGNAT — провайдер делит публичный IP между сотнями
+                    абонентов. Прямой проброс невозможен.
+                  </div>
+                  <div>Варианты:</div>
+                  <ul>
+                    <li>
+                      Запросить у провайдера «белый IP» (часто платная опция,
+                      ~50–200₽/мес)
+                    </li>
+                    <li>
+                      Использовать IPv6 (если провайдер выдаёт)
+                      {hasIPv6
+                        ? ' — у нас определён, см. IPv6-ссылку выше'
+                        : ' — у нас не определён, проверь настройки сети'}
+                    </li>
+                    <li>
+                      Поднять reverse-tunnel через свой VPS (frp, wireguard) —
+                      нужен €3/мес VPS
+                    </li>
+                    <li>Mesh-VPN (Tailscale, ZeroTier) — гости ставят клиент</li>
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {diagnosis &&
+            diagnosis.status === 'behind-cgnat' &&
+            hasIPv6 && (
+              <div className="diagnosis-banner ok-with-ipv6">
+                <span>
+                  <span aria-hidden="true">✅ </span>
+                  IPv6 определён — гости с IPv6 (большинство мобильных) смогут
+                  подключиться по IPv6-ссылке
+                </span>
               </div>
             )}
-          </div>
         </div>
       )}
 
