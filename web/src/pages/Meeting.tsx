@@ -36,6 +36,10 @@ import type {
 import VideoGrid from '../components/VideoGrid';
 import Controls from '../components/Controls';
 import ConnectionBadge from '../components/ConnectionBadge';
+import ChatPanel, { type ChatPanelMessage } from '../components/ChatPanel';
+import ReactionsLayer, {
+  type FloatingReaction,
+} from '../components/ReactionsLayer';
 
 type Mode = 'sfu' | 'p2p';
 
@@ -491,6 +495,26 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // как обычно. См. useEffect ниже.
   const [chromeVisible, setChromeVisible] = useState<boolean>(true);
   const idleTimerRef = useRef<number | null>(null);
+
+  // Chat state. messages — все полученные/отправленные сообщения; chatOpen —
+  // открыт ли sidebar; unreadChat — счётчик непрочитанных (увеличивается при
+  // приходе чужого сообщения когда панель закрыта; сбрасывается на open).
+  // Сообщения НЕ персистятся между переподключениями к комнате — это
+  // эфемерный data-channel чат, как в Google Meet/Zoom без записи.
+  const [chatMessages, setChatMessages] = useState<ChatPanelMessage[]>([]);
+  const [chatOpen, setChatOpen] = useState<boolean>(false);
+  const [unreadChat, setUnreadChat] = useState<number>(0);
+  // Чтобы коллбэк onChatMessage внутри P2PMeetEvents (создаваемый ОДИН раз
+  // при start()) видел актуальное chatOpen без устаревшего closure.
+  const chatOpenRef = useRef<boolean>(false);
+  useEffect(() => {
+    chatOpenRef.current = chatOpen;
+  }, [chatOpen]);
+
+  // Reactions state. Каждая активная floating-реакция держится 5 секунд
+  // (соответствует CSS-анимации zubrameet-reaction-fall). Чистим через
+  // setTimeout, чтобы DOM-нода ушла после завершения анимации.
+  const [reactions, setReactions] = useState<FloatingReaction[]>([]);
 
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
@@ -1070,6 +1094,43 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           });
         }
       },
+      onChatMessage: (peerId, msg) => {
+        // peerId === 'self' — наше собственное сообщение (P2PMeetConnection
+        // эмитит его локально для единообразного UI). Помечаем local=true,
+        // чтобы ChatPanel выровнял/подсветил иначе.
+        const local = peerId === 'self';
+        setChatMessages((prev) => {
+          // Дедуп по id — на случай если кто-то когда-нибудь добавит relay/repeat.
+          if (prev.some((m) => m.id === msg.id)) return prev;
+          return [...prev, { ...msg, local }];
+        });
+        // Если чат закрыт И сообщение пришло от ДРУГОГО — увеличиваем
+        // unread-счётчик. Свои сообщения (local) не считаем.
+        if (!local && !chatOpenRef.current) {
+          setUnreadChat((c) => c + 1);
+        }
+      },
+      onReaction: (_peerId, payload) => {
+        // Создаём floating-emoji с уникальным id, рандомной горизонтальной
+        // позицией и sway. Через 5s удаляем из state — анимация уже завершилась
+        // и DOM-нода больше не нужна.
+        const id =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `r-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const leftPct = 10 + Math.random() * 80; // 10–90%
+        const swayPx = (Math.random() * 2 - 1) * 50; // ±50px
+        const reaction: FloatingReaction = {
+          id,
+          emoji: payload.emoji,
+          leftPct,
+          swayPx,
+        };
+        setReactions((prev) => [...prev, reaction]);
+        window.setTimeout(() => {
+          setReactions((prev) => prev.filter((r) => r.id !== id));
+        }, 5000);
+      },
     };
 
     const conn = new P2PMeetConnection(roomId, myDisplay, events, password);
@@ -1409,6 +1470,27 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           }, 8000);
         });
     }
+  };
+
+  // Открыть/закрыть чат-sidebar. На открытие — сбрасываем unread-счётчик
+  // (мы только что увидели всё, что было). На закрытие — оставляем как есть.
+  const handleToggleChat = (): void => {
+    setChatOpen((prev) => {
+      const next = !prev;
+      if (next) setUnreadChat(0);
+      return next;
+    });
+  };
+
+  // Отправка чат-сообщения. В SFU режиме — пока no-op (нет data-channel
+  // action'ов в MeetConnection); чат работает только в P2P.
+  const handleSendChat = (text: string): void => {
+    p2pConnectionRef.current?.sendChatMessage(text);
+  };
+
+  // Отправка emoji-реакции. Аналогично — только P2P.
+  const handleSendReaction = (emoji: string): void => {
+    p2pConnectionRef.current?.sendReaction(emoji);
   };
 
   const handleLeave = (): void => {
@@ -2069,8 +2151,27 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         onChangeScreenQuality={setScreenQuality}
         onLeave={handleLeave}
         onCopyInvite={handleCopyInvite}
+        onSendReaction={handleSendReaction}
+        chatOpen={chatOpen}
+        unreadChat={unreadChat}
+        onToggleChat={handleToggleChat}
         hidden={!chromeVisible}
       />
+
+      {/* Чат-sidebar. Не размонтируем — чтобы сохранить ввод/историю при
+          закрытии. Visibility — через transform/opacity (см. ChatPanel). */}
+      {chatOpen && (
+        <ChatPanel
+          messages={chatMessages}
+          onSend={handleSendChat}
+          onClose={handleToggleChat}
+          hidden={!chromeVisible}
+        />
+      )}
+
+      {/* Floating emoji-реакции поверх всего. pointer-events: none — не
+          мешают кликам. Чистится через setTimeout в onReaction. */}
+      <ReactionsLayer reactions={reactions} />
 
       {reconnecting && (
         <div style={overlayStyle} role="alert" aria-live="assertive">

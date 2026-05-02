@@ -56,6 +56,29 @@ export interface P2PScreenState {
   [key: string]: boolean | string;
 }
 
+// Чат-сообщение через data-channel ('chat' action). Текст ограничен 2000
+// символами на отправителе (slice). id — uuid (crypto.randomUUID), помогает
+// idempotently дедуплицировать дубли (если когда-нибудь добавим relay/repeat).
+// Index-signature — для совместимости с Trystero JsonValue.
+export interface ChatMessage {
+  id: string;
+  text: string;
+  ts: number;
+  fromName: string;
+  [key: string]: string | number;
+}
+
+// Emoji-reaction через data-channel ('reaction' action). emoji — короткая
+// строка (1–4 codepoint'а, ограничено 12 chars на стороне отправителя).
+// fromName/ts — для возможной подписи под анимацией реакции (сейчас не
+// используется в UI, но дешёво иметь).
+export interface ReactionPayload {
+  emoji: string;
+  ts: number;
+  fromName: string;
+  [key: string]: string | number;
+}
+
 export interface P2PMeetEvents {
   onLocalStream(stream: MediaStream): void;
   // kind — 'camera' (default) | 'screen'. Опционален для backwards compat:
@@ -80,6 +103,11 @@ export interface P2PMeetEvents {
   // use-case — гарантированный teardown screen-tile при active=false (на
   // случай, если onended track-event не дошёл до receiver'а).
   onPeerScreenState?(peerId: string, state: P2PScreenState): void;
+  // Получено чат-сообщение. peerId === 'self' для собственного отправленного
+  // (sendChatMessage эмитит локально, чтобы UI единообразно работал с ним).
+  onChatMessage?(peerId: string, msg: ChatMessage): void;
+  // Получена emoji-реакция. peerId === 'self' для своих реакций.
+  onReaction?(peerId: string, payload: ReactionPayload): void;
 }
 
 const APP_ID = 'zubrameet';
@@ -109,6 +137,10 @@ export class P2PMeetConnection {
   // 'screen-state' action — broadcast {active, streamId?} при старте/остановке
   // screen-share. Гарантированный teardown даже если onended не доходит.
   private sendScreenState: ActionSender<P2PScreenState> | null = null;
+  // 'chat' action — отправка текстовых сообщений в правый sidebar.
+  private sendChat: ActionSender<ChatMessage> | null = null;
+  // 'reaction' action — отправка одиночных emoji для floating-анимации.
+  private sendReactionAction: ActionSender<ReactionPayload> | null = null;
   // Текущее локальное cam/mic state. По умолчанию обе включены — это
   // отражает поведение acquireMedia + setMicOn(true)/setCamOn(true) в Meeting.tsx.
   private localMediaState: P2PMediaState = { cam: true, mic: true };
@@ -281,6 +313,60 @@ export class P2PMeetConnection {
           this.events.onPeerScreenState?.(peerId, state);
         } catch (err) {
           this.reportError(err, 'getScreenState');
+        }
+      });
+
+      // chat action — текстовые сообщения в правый sidebar.
+      const [sendChat, getChat] = room.makeAction<ChatMessage>('chat');
+      this.sendChat = sendChat;
+      getChat((data, peerId) => {
+        try {
+          if (!data || typeof data !== 'object') return;
+          const m = data as ChatMessage;
+          if (
+            typeof m.text !== 'string' ||
+            typeof m.id !== 'string' ||
+            typeof m.fromName !== 'string' ||
+            typeof m.ts !== 'number'
+          ) {
+            return;
+          }
+          // Оборонительный slice — пиры могут шалить.
+          const safe: ChatMessage = {
+            id: m.id.slice(0, 64),
+            text: m.text.slice(0, 2000),
+            ts: m.ts,
+            fromName: m.fromName.slice(0, 64),
+          };
+          this.events.onChatMessage?.(peerId, safe);
+        } catch (err) {
+          this.reportError(err, 'getChat');
+        }
+      });
+
+      // reaction action — emoji для floating-анимации.
+      const [sendReactionAction, getReaction] =
+        room.makeAction<ReactionPayload>('reaction');
+      this.sendReactionAction = sendReactionAction;
+      getReaction((data, peerId) => {
+        try {
+          if (!data || typeof data !== 'object') return;
+          const r = data as ReactionPayload;
+          if (
+            typeof r.emoji !== 'string' ||
+            typeof r.ts !== 'number' ||
+            typeof r.fromName !== 'string'
+          ) {
+            return;
+          }
+          const safe: ReactionPayload = {
+            emoji: r.emoji.slice(0, 12),
+            ts: r.ts,
+            fromName: r.fromName.slice(0, 64),
+          };
+          this.events.onReaction?.(peerId, safe);
+        } catch (err) {
+          this.reportError(err, 'getReaction');
         }
       });
 
@@ -659,6 +745,79 @@ export class P2PMeetConnection {
    * Trystero room поднялся») — просто запоминаем localMediaState; первый
    * onPeerJoin отправит свежее значение новому peer'у.
    */
+  // ─── chat ────────────────────────────────────────────────────────────────
+
+  /**
+   * Отправляет чат-сообщение всем peer'ам и эмитит локально (peerId='self'),
+   * чтобы UI единообразно работал с собственным сообщением. Пустой/whitespace
+   * текст игнорируется. До start() — no-op (sendChat ещё не зарегистрирован);
+   * чтобы не терять текст до подключения, caller может буферизовать локально.
+   */
+  sendChatMessage(text: string): void {
+    if (!this.sendChat) return;
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return;
+    const msg: ChatMessage = {
+      id:
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      text: trimmed.slice(0, 2000),
+      ts: Date.now(),
+      fromName: this.displayName,
+    };
+    try {
+      const result: unknown = this.sendChat(msg);
+      if (result && typeof (result as Promise<unknown>).then === 'function') {
+        (result as Promise<unknown>).catch((err: unknown) => {
+          this.reportError(err, 'sendChat(broadcast)');
+        });
+      }
+    } catch (err) {
+      this.reportError(err, 'sendChat(broadcast)');
+    }
+    // Локально эмитим — UI добавит сообщение в свой список без ожидания
+    // round-trip через Trystero.
+    try {
+      this.events.onChatMessage?.('self', msg);
+    } catch (err) {
+      this.reportError(err, 'onChatMessage(self)');
+    }
+  }
+
+  // ─── reactions ───────────────────────────────────────────────────────────
+
+  /**
+   * Бродкастит emoji-реакцию всем peer'ам и эмитит её локально (peerId='self'),
+   * чтобы у отправителя тоже отрисовалась анимация падающего смайла. Пустая
+   * строка игнорируется.
+   */
+  sendReaction(emoji: string): void {
+    if (!this.sendReactionAction) return;
+    const trimmed = emoji.trim();
+    if (trimmed.length === 0) return;
+    const payload: ReactionPayload = {
+      emoji: trimmed.slice(0, 12),
+      ts: Date.now(),
+      fromName: this.displayName,
+    };
+    try {
+      const result: unknown = this.sendReactionAction(payload);
+      if (result && typeof (result as Promise<unknown>).then === 'function') {
+        (result as Promise<unknown>).catch((err: unknown) => {
+          this.reportError(err, 'sendReaction(broadcast)');
+        });
+      }
+    } catch (err) {
+      this.reportError(err, 'sendReaction(broadcast)');
+    }
+    try {
+      this.events.onReaction?.('self', payload);
+    } catch (err) {
+      this.reportError(err, 'onReaction(self)');
+    }
+  }
+
   setMediaState(state: P2PMediaState): void {
     this.localMediaState = { cam: state.cam, mic: state.mic };
     if (!this.sendMediaState) {
@@ -704,6 +863,8 @@ export class P2PMeetConnection {
     this.sendName = null;
     this.sendMediaState = null;
     this.sendScreenState = null;
+    this.sendChat = null;
+    this.sendReactionAction = null;
     this.cameraStream = null;
     this.peerNames.clear();
     this.peerStreams.clear();

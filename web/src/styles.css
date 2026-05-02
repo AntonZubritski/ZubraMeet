@@ -216,6 +216,15 @@ input:focus, select:focus, textarea:focus {
   100% { transform: scale(2.4); opacity: 0; }
 }
 
+/* Floating-emoji реакции: emoji падает сверху вниз c лёгким горизонтальным
+   качанием (--sway custom-prop задаётся inline в ReactionsLayer). 5s linear,
+   растворяется в последние 30%. */
+@keyframes zubrameet-reaction-fall {
+  0%   { transform: translateY(0)       translateX(0);                  opacity: 1; }
+  70%  { opacity: 1; }
+  100% { transform: translateY(110vh)   translateX(var(--sway, 0px));   opacity: 0; }
+}
+
 /* CSS-tooltip через data-tip. Появляется мгновенно (без 2-сек задержки
    нативного title=), не блокирует layout (position: absolute), не зависит
    от ОС/браузера. Любой элемент с data-tip="..." получит подсказку при hover. */

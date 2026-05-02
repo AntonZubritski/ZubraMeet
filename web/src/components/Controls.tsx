@@ -9,6 +9,7 @@ import {
   SCREEN_QUALITY_PRESETS,
   type ScreenQuality,
 } from '../lib/screen-quality';
+import EmojiPicker from './EmojiPicker';
 
 interface Props {
   micOn: boolean;
@@ -25,6 +26,16 @@ interface Props {
   onChangeScreenQuality(q: ScreenQuality): void;
   onLeave(): void;
   onCopyInvite(): void;
+  // Emoji-реакция: при клике на smile-кнопку открывается popover с emoji-grid.
+  // Выбор emoji вызывает onSendReaction(emoji) — родитель прокидывает в
+  // P2PMeetConnection.sendReaction.
+  onSendReaction(emoji: string): void;
+  // Чат-sidebar: toggle открытия. unreadChat — счётчик непрочитанных
+  // сообщений (рендерится бейджем над кнопкой). Когда чат уже открыт,
+  // unreadChat должен быть 0 (родитель сбрасывает на open).
+  chatOpen: boolean;
+  unreadChat: number;
+  onToggleChat(): void;
   // Auto-hide chrome: когда true — bar уезжает вниз (translateY(100%)),
   // opacity 0, pointer-events: none. Любой tap/mousemove на странице снова
   // покажет (логика в Meeting.tsx через idle-timer). Optional, default = false.
@@ -288,6 +299,45 @@ function CopyIcon() {
     >
       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  );
+}
+
+function SmileIcon() {
+  return (
+    <svg
+      width={ICON_SIZE}
+      height={ICON_SIZE}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+      <line x1="9" y1="9" x2="9.01" y2="9" />
+      <line x1="15" y1="9" x2="15.01" y2="9" />
+    </svg>
+  );
+}
+
+function ChatIcon() {
+  return (
+    <svg
+      width={ICON_SIZE}
+      height={ICON_SIZE}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
     </svg>
   );
 }
@@ -565,6 +615,115 @@ function ScreenShareControl({
   );
 }
 
+// Smile-кнопка с popover. Popover EmojiPicker сам слушает clickoutside/Esc.
+// Здесь — только круглая кнопка + ref-обёртка для абсолютного позиционирования.
+interface SmileButtonProps {
+  onPick(emoji: string): void;
+}
+function SmileButton({ onPick }: SmileButtonProps) {
+  const [open, setOpen] = useState(false);
+  const [hovered, setHovered] = useState(false);
+
+  const handlePick = (emoji: string): void => {
+    onPick(emoji);
+    setOpen(false);
+  };
+
+  const wrapperStyle: CSSProperties = {
+    position: 'relative',
+    display: 'inline-flex',
+    alignItems: 'center',
+  };
+
+  return (
+    <div style={wrapperStyle}>
+      <button
+        type="button"
+        style={buttonStyle('default', hovered)}
+        onClick={() => setOpen((v) => !v)}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onFocus={() => setHovered(true)}
+        onBlur={() => setHovered(false)}
+        aria-label="Отправить реакцию"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-pressed={open}
+        title="Отправить реакцию"
+      >
+        <SmileIcon />
+      </button>
+      {open && <EmojiPicker onPick={handlePick} onClose={() => setOpen(false)} />}
+    </div>
+  );
+}
+
+// Chat-кнопка с unread-бейджем. Бейдж — маленький круг с числом в правом
+// верхнем углу. Когда чат уже открыт — бейдж не рендерится (родитель и так
+// сбрасывает unreadChat в 0 при открытии, но дополнительная защита от мигания).
+interface ChatButtonProps {
+  open: boolean;
+  unread: number;
+  onClick(): void;
+}
+function ChatButton({ open, unread, onClick }: ChatButtonProps) {
+  const [hovered, setHovered] = useState(false);
+  const variant: Variant = open ? 'active' : 'default';
+  const showBadge = !open && unread > 0;
+  const badgeText = unread > 99 ? '99+' : String(unread);
+
+  const wrapperStyle: CSSProperties = {
+    position: 'relative',
+    display: 'inline-flex',
+    alignItems: 'center',
+  };
+
+  const badgeStyle: CSSProperties = {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    minWidth: 18,
+    height: 18,
+    padding: '0 5px',
+    borderRadius: 999,
+    background: 'var(--danger)',
+    color: '#fff',
+    fontSize: 10,
+    fontWeight: 700,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    border: '2px solid rgba(20, 20, 20, 0.85)',
+    pointerEvents: 'none',
+    boxSizing: 'content-box',
+    lineHeight: 1,
+  };
+
+  return (
+    <div style={wrapperStyle}>
+      <button
+        type="button"
+        style={buttonStyle(variant, hovered)}
+        onClick={onClick}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onFocus={() => setHovered(true)}
+        onBlur={() => setHovered(false)}
+        aria-label={open ? 'Закрыть чат' : 'Открыть чат'}
+        aria-pressed={open}
+        title={open ? 'Закрыть чат' : 'Открыть чат'}
+      >
+        <ChatIcon />
+      </button>
+      {showBadge && (
+        <span style={badgeStyle} aria-label={`Непрочитанных: ${unread}`}>
+          {badgeText}
+        </span>
+      )}
+    </div>
+  );
+}
+
 export default function Controls({
   micOn,
   camOn,
@@ -576,6 +735,10 @@ export default function Controls({
   onChangeScreenQuality,
   onLeave,
   onCopyInvite,
+  onSendReaction,
+  chatOpen,
+  unreadChat,
+  onToggleChat,
   hidden = false,
 }: Props) {
   const style: CSSProperties = hidden ? { ...barStyle, ...barHiddenStyle } : barStyle;
@@ -607,6 +770,10 @@ export default function Controls({
           onChangeQuality={onChangeScreenQuality}
         />
       )}
+
+      <SmileButton onPick={onSendReaction} />
+
+      <ChatButton open={chatOpen} unread={unreadChat} onClick={onToggleChat} />
 
       <CircleButton
         variant="default"
