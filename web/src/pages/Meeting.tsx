@@ -45,6 +45,14 @@ interface PeerEntry {
   name: string;
 }
 
+// Удалённый screen-share от пира. Ключ — `${peerId}:${stream.id}` (на случай
+// если один пир пошлёт несколько screen-стримов; пока маловероятно, но не дороже).
+interface RemoteScreenEntry {
+  stream: MediaStream;
+  peerName: string;
+  peerId: string;
+}
+
 const NAME_KEY = 'zubrameet.name';
 const STATS_INTERVAL_MS = 2000;
 
@@ -346,6 +354,11 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [screenSharing, setScreenSharing] = useState<boolean>(false);
   const [peers, setPeers] = useState<Map<string, PeerEntry>>(() => new Map());
+  // Удалённые screen-share стримы (только в P2P-режиме — в SFU всё прилетает
+  // через onRemoteTrack как обычный track одного stream'а).
+  const [remoteScreens, setRemoteScreens] = useState<Map<string, RemoteScreenEntry>>(
+    () => new Map(),
+  );
   const [micOn, setMicOn] = useState<boolean>(true);
   const [camOn, setCamOn] = useState<boolean>(true);
   const [stats, setStats] = useState<ConnectionStats | null>(null);
@@ -710,7 +723,33 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       onLocalStream: () => {
         // уже в state.
       },
-      onRemoteStream: (peerId, remoteStream, name) => {
+      onRemoteStream: (peerId, remoteStream, name, kind) => {
+        if (kind === 'screen') {
+          // Ключ remoteScreens — уникальный per (peerId,streamId). Если пир
+          // пере-расшарит экран, у нового стрима будет другой stream.id, а
+          // старый будет очищен через track.onended ниже / peer-left.
+          const key = `${peerId}:${remoteStream.id}`;
+          setRemoteScreens((prev) => {
+            const next = new Map(prev);
+            next.set(key, { stream: remoteStream, peerName: name, peerId });
+            return next;
+          });
+          // Когда пир остановит share — все его screen-треки кончатся.
+          // Подвешиваем onended на video-track чтобы убрать tile.
+          for (const t of remoteStream.getVideoTracks()) {
+            const onEnded = (): void => {
+              setRemoteScreens((prev) => {
+                if (!prev.has(key)) return prev;
+                const next = new Map(prev);
+                next.delete(key);
+                return next;
+              });
+            };
+            t.addEventListener('ended', onEnded);
+          }
+          return;
+        }
+        // camera (default)
         setPeers((prev) => {
           const next = new Map(prev);
           next.set(peerId, { stream: remoteStream, name });
@@ -729,6 +768,18 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
           }
           return next;
         });
+        // И в screen-tiles тоже обновим имя.
+        setRemoteScreens((prev) => {
+          let changed = false;
+          const next = new Map(prev);
+          for (const [k, v] of prev) {
+            if (v.peerId === peerId && v.peerName !== name) {
+              next.set(k, { ...v, peerName: name });
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
       },
       onPeerLeft: (peerId) => {
         peerNamesRef.current.delete(peerId);
@@ -738,6 +789,18 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
           next.delete(peerId);
           return next;
         });
+        // И прибираем все screen-tiles этого пира.
+        setRemoteScreens((prev) => {
+          let changed = false;
+          const next = new Map(prev);
+          for (const [k, v] of prev) {
+            if (v.peerId === peerId) {
+              next.delete(k);
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
       },
       onConnectionState: () => {
         // Не показываем per-peer состояние в UI — только агрегат через ConnectionBadge.
@@ -745,6 +808,15 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       onError: (err) => {
         console.error('[Meeting/p2p]', err);
         // P2P-ошибки в целом не валят сессию (Nostr-relay может временно отвалиться).
+      },
+      onScreenShareStarted: () => {
+        // Установлено в handleToggleScreenShare; колбэк нужен на случай
+        // программного запуска screen share в будущем.
+      },
+      onScreenShareStopped: () => {
+        // Может прийти при browser "Stop sharing" — синхронизируем UI.
+        setScreenSharing(false);
+        setScreenStream(null);
       },
     };
 
@@ -971,9 +1043,12 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
   };
 
   const handleToggleScreenShare = (): void => {
-    // Screen share пока работает только в SFU-режиме (Trystero-API для замены/добавления
-    // sender'ов на лету усложняется при mesh — оставляем на будущее).
-    const conn = sfuConnectionRef.current;
+    // Screen-share работает в обоих режимах — выбираем активное соединение.
+    // SFU и P2P API совместимы по сигнатуре start/stopScreenShare.
+    const sfu = sfuConnectionRef.current;
+    const p2p = p2pConnectionRef.current;
+    const conn: { startScreenShare(): Promise<MediaStream>; stopScreenShare(): Promise<void> } | null =
+      sfu ?? p2p ?? null;
     if (!conn) return;
     if (screenSharing) {
       void conn
@@ -1144,6 +1219,18 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
     });
   }
 
+  // Удалённые screen-share стримы (P2P). В SFU удалённый screen прилетает
+  // через onRemoteTrack и попадает в peers как часть стрима того же пира.
+  for (const [key, entry] of remoteScreens) {
+    const peerName =
+      entry.peerName && entry.peerName.length > 0 ? entry.peerName : 'Участник';
+    tiles.push({
+      id: `screen-${key}`,
+      stream: entry.stream,
+      name: `Экран: ${peerName}`,
+    });
+  }
+
   const size = getVideoSize(localStream);
   const resTitle = size
     ? `Локальное видео: ${size.w}×${size.h}`
@@ -1158,7 +1245,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
   const modeBadgeLabel = resolvedMode === 'p2p' ? '🌐 P2P-режим' : '📡 SFU-режим';
   const modeBadgeTitle =
     resolvedMode === 'p2p'
-      ? 'P2P: видео идёт напрямую между всеми (mesh через Nostr-сигналинг). Хорошо для маленьких комнат и хостов за CGNAT.'
+      ? 'P2P: видео идёт напрямую между всеми (mesh через Nostr-сигналинг). Хорошо для маленьких комнат и хостов за CGNAT. Если за symmetric NAT — fallback через бесплатный публичный TURN (OpenRelay).'
       : 'SFU: видео идёт через хоста-сервер. Лучше масштабируется на много участников.';
 
   return (

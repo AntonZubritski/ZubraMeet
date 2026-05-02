@@ -1,4 +1,5 @@
 import { SignalClient } from './signal';
+import { PUBLIC_ICE_SERVERS } from './ice';
 import type {
   Envelope,
   PeerInfo,
@@ -29,7 +30,7 @@ interface StatsSnapshot {
   packetsReceived: number;
 }
 
-const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = PUBLIC_ICE_SERVERS;
 
 const RECONNECT_MAX_ATTEMPTS = 5;
 const RECONNECT_BACKOFFS_MS = [1000, 2000, 4000, 8000, 8000];

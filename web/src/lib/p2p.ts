@@ -7,19 +7,35 @@
 //
 // Отличия от SignalClient+MeetConnection:
 // - нет своего WebSocket-сервера
-// - нет screen-share API (на этапе MVP)
 // - нет publish/subscribe-PC; одна RTCPeerConnection-на-пира под капотом Trystero
 // - peerId — selfId Trystero (≠ clientId SFU-сервера)
+//
+// Screen-share: реализован через room.addStream(stream, null, 'screen') —
+// третий аргумент в Trystero — metadata, передаётся приёмнику в onPeerStream
+// третьим аргументом. По нему различаем camera vs screen.
 
 import { joinRoom, type Room, type ActionSender } from 'trystero';
+import { PUBLIC_ICE_SERVERS } from './ice';
+
+export type RemoteStreamKind = 'camera' | 'screen';
 
 export interface P2PMeetEvents {
   onLocalStream(stream: MediaStream): void;
-  onRemoteStream(peerId: string, stream: MediaStream, name: string): void;
+  // kind — 'camera' (default) | 'screen'. Опционален для backwards compat:
+  // существующие потребители получают undefined и могут трактовать как camera.
+  onRemoteStream(
+    peerId: string,
+    stream: MediaStream,
+    name: string,
+    kind?: RemoteStreamKind,
+  ): void;
   onPeerJoined(peerId: string, name: string): void;
   onPeerLeft(peerId: string): void;
   onConnectionState(peerId: string, state: RTCPeerConnectionState): void;
   onError(err: Error): void;
+  // Локальный screen-share API (mirror MeetConnection events).
+  onScreenShareStarted?(stream: MediaStream): void;
+  onScreenShareStopped?(): void;
 }
 
 const APP_ID = 'zubrameet';
@@ -27,6 +43,10 @@ const APP_ID = 'zubrameet';
 // "name" action — каждый peer при подключении отправляет своё display-name.
 // Payload — просто строка. Trystero сериализует JsonValue в data-channel под капотом.
 type NamePayload = string;
+
+// Метаданные стрима, которые Trystero пробрасывает в onPeerStream.
+// Используем строку вместо объекта — короче и совместимо с Trystero JsonValue.
+const STREAM_META_SCREEN = 'screen';
 
 export class P2PMeetConnection {
   private readonly roomId: string;
@@ -44,6 +64,9 @@ export class P2PMeetConnection {
   private readonly peerStreams: Map<string, MediaStream> = new Map();
   // peerId → RTCPeerConnection — для отслеживания connectionstatechange.
   private readonly trackedPCs: Map<string, RTCPeerConnection> = new Map();
+
+  // Локальный screen-share стрим, если активен.
+  private screenStream: MediaStream | null = null;
 
   private closed = false;
   // Чтобы start() нельзя было вызвать дважды.
@@ -71,7 +94,12 @@ export class P2PMeetConnection {
 
       let room: Room;
       try {
-        room = joinRoom({ appId: APP_ID }, this.roomId);
+        // rtcConfig: бесплатные публичные STUN+TURN из ice.ts. TURN критичен
+        // для symmetric NAT (≈15–20% сетей), без него P2P-mesh не пробьётся.
+        room = joinRoom(
+          { appId: APP_ID, rtcConfig: { iceServers: PUBLIC_ICE_SERVERS } },
+          this.roomId,
+        );
       } catch (err) {
         this.reportError(err, 'joinRoom');
         return;
@@ -120,6 +148,25 @@ export class P2PMeetConnection {
               this.reportError(err, 'sendName(onPeerJoin)');
             });
           }
+          // Если у нас уже активен screen-share — пушим его новому пиру.
+          // Trystero сам не реплеит ранее добавленные доп. стримы для новых
+          // подключений, поэтому делаем это вручную.
+          if (this.screenStream && this.room) {
+            try {
+              const promises = this.room.addStream(
+                this.screenStream,
+                peerId,
+                STREAM_META_SCREEN,
+              );
+              for (const p of promises) {
+                p.catch((err: unknown) => {
+                  this.reportError(err, 'addStream(screen,newPeer)');
+                });
+              }
+            } catch (err) {
+              this.reportError(err, 'addStream(screen,newPeer)');
+            }
+          }
           // Подвешиваемся на connectionstatechange низлежащего PC.
           this.trackPeerPC(peerId);
         } catch (err) {
@@ -138,11 +185,18 @@ export class P2PMeetConnection {
         }
       });
 
-      room.onPeerStream((stream, peerId) => {
+      room.onPeerStream((stream, peerId, metadata) => {
         try {
-          this.peerStreams.set(peerId, stream);
+          // metadata третьим аргументом приходит из room.addStream(stream, peers, metadata)
+          // на отправляющей стороне. Если metadata === 'screen' — это screen-share,
+          // иначе считаем камерой (default).
+          const kind: RemoteStreamKind =
+            metadata === STREAM_META_SCREEN ? 'screen' : 'camera';
+          if (kind === 'camera') {
+            this.peerStreams.set(peerId, stream);
+          }
           const name = this.peerNames.get(peerId) ?? 'Участник';
-          this.events.onRemoteStream(peerId, stream, name);
+          this.events.onRemoteStream(peerId, stream, name, kind);
         } catch (err) {
           this.reportError(err, 'onPeerStream');
         }
@@ -152,9 +206,114 @@ export class P2PMeetConnection {
     }
   }
 
+  // ─── screen sharing ────────────────────────────────────────────────────────
+
+  /**
+   * Запускает screen-share: берёт displayMedia, публикует в room с metadata='screen',
+   * вешает onended на video-track (на случай "Stop sharing" из браузерного UI).
+   * Возвращает полученный MediaStream — caller может использовать для локального preview.
+   * Идемпотентен: повторный вызов при активном screen-share вернёт уже полученный стрим.
+   */
+  async startScreenShare(): Promise<MediaStream> {
+    if (this.screenStream) {
+      return this.screenStream;
+    }
+    const room = this.room;
+    if (!room) {
+      throw new Error('startScreenShare: room not ready');
+    }
+
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30 } },
+      audio: false,
+    });
+
+    // Запоминаем до addStream, чтобы onended-handler знал что мы это запустили.
+    this.screenStream = stream;
+
+    // "Stop sharing" из браузерного UI кончает video-track → стопим всё.
+    for (const track of stream.getTracks()) {
+      track.onended = () => {
+        if (this.screenStream === stream) {
+          void this.stopScreenShare();
+        }
+      };
+    }
+
+    try {
+      // Второй аргумент null = всем активным peer'ам, третий = metadata.
+      const promises = room.addStream(stream, null, STREAM_META_SCREEN);
+      for (const p of promises) {
+        p.catch((err: unknown) => {
+          this.reportError(err, 'addStream(screen)');
+        });
+      }
+    } catch (err) {
+      this.reportError(err, 'addStream(screen)');
+    }
+
+    try {
+      this.events.onScreenShareStarted?.(stream);
+    } catch (err) {
+      this.reportError(err, 'onScreenShareStarted');
+    }
+
+    return stream;
+  }
+
+  /**
+   * Останавливает screen-share: снимает стрим со всех пиров, стопит локальные
+   * треки, вызывает onScreenShareStopped. Идемпотентен: если screen-share не
+   * активен — no-op.
+   */
+  async stopScreenShare(): Promise<void> {
+    const stream = this.screenStream;
+    if (!stream) return;
+    // Сразу обнуляем чтобы onended не зашёл рекурсивно.
+    this.screenStream = null;
+
+    const room = this.room;
+    if (room) {
+      try {
+        // Trystero room.removeStream возвращает void (см. types.d.mts).
+        room.removeStream(stream);
+      } catch (err) {
+        this.reportError(err, 'removeStream(screen)');
+      }
+    }
+
+    for (const track of stream.getTracks()) {
+      try {
+        track.onended = null;
+        track.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    try {
+      this.events.onScreenShareStopped?.();
+    } catch (err) {
+      this.reportError(err, 'onScreenShareStopped');
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
+
+    // Стопим screen-share треки если активен (мы их создавали — мы и убираем).
+    if (this.screenStream) {
+      for (const t of this.screenStream.getTracks()) {
+        try {
+          t.onended = null;
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.screenStream = null;
+    }
 
     const room = this.room;
     this.room = null;

@@ -89,11 +89,34 @@ type Server struct {
 	relayMgr relayManager
 }
 
-// defaultSTUN возвращает дефолтный список ICE-серверов. Используется когда
-// конфиг ICE не задан явно — берём публичный Google STUN.
-func defaultSTUN() []sfu.ICEServer {
+// defaultICEServers возвращает дефолтный список ICE-серверов. Используется
+// когда конфиг ICE не задан явно — публичные STUN + бесплатный публичный TURN
+// (OpenRelay от Metered.ca, ~5GB/мес лимит, без регистрации).
+//
+// TURN критичен для пробивания symmetric NAT (~15–20% сетей, в основном
+// корпоративные и часть мобильных провайдеров) — в этих случаях STUN не
+// помогает и медиа-сессия не установится без relay.
+func defaultICEServers() []sfu.ICEServer {
 	return []sfu.ICEServer{
+		// STUN — публичные, бесплатные.
 		{URLs: []string{"stun:stun.l.google.com:19302"}},
+		{URLs: []string{"stun:stun.cloudflare.com:3478"}},
+		// TURN — OpenRelay free public.
+		{
+			URLs:       []string{"turn:openrelay.metered.ca:80"},
+			Username:   "openrelayproject",
+			Credential: "openrelayproject",
+		},
+		{
+			URLs:       []string{"turn:openrelay.metered.ca:443"},
+			Username:   "openrelayproject",
+			Credential: "openrelayproject",
+		},
+		{
+			URLs:       []string{"turn:openrelay.metered.ca:443?transport=tcp"},
+			Username:   "openrelayproject",
+			Credential: "openrelayproject",
+		},
 	}
 }
 
@@ -104,7 +127,7 @@ func New(cfg Config) *Server {
 	rooms := room.NewRegistry()
 
 	sfuInst, err := sfu.New(sfu.Config{
-		ICEServers: defaultSTUN(),
+		ICEServers: defaultICEServers(),
 		Rooms:      rooms,
 	})
 	if err != nil {
