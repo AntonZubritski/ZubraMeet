@@ -456,6 +456,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // peerId → displayName (peer.id из welcome/peer-joined может НЕ совпадать со stream.id —
   // см. webrtc.ts: TODO mid→peerId mapping. Пока храним по обоим ключам как сможем.)
   const peerNamesRef = useRef<Map<string, string>>(new Map());
+  // P2P: буфер последнего media-state от peer'а на случай, если он пришёл
+  // ДО onRemoteStream (тогда peers Map ещё не имеет записи и мы бы потеряли
+  // апдейт). При создании записи применим буферизованное состояние.
+  const peerMediaBufRef = useRef<Map<string, { cam: boolean; mic: boolean }>>(new Map());
   // Чтобы избежать двойной инициализации в StrictMode dev.
   const startedRef = useRef<boolean>(false);
 
@@ -820,7 +824,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         // Подписываемся на mute/unmute видео-track'а удалённого peer'а —
         // браузер выставляет track.muted = true когда удалённая сторона
         // отключила свой track (track.enabled=false на их стороне или
-        // выключение камеры). Без этого у нас был чёрный экран без аватара.
+        // выключение камеры). Это back-up к 'media' action — track.muted
+        // срабатывает при replaceTrack/потере данных, action — при явном
+        // toggle. Оставляем оба для надёжности.
         const updateCamMuted = (muted: boolean): void => {
           setPeers((prev) => {
             const cur = prev.get(peerId);
@@ -832,15 +838,25 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           });
         };
         const videoTracks = remoteStream.getVideoTracks();
-        const initialCamMuted =
+        const trackCamMuted =
           videoTracks.length === 0 || videoTracks.every((t) => t.muted);
         for (const t of videoTracks) {
           t.addEventListener('mute', () => updateCamMuted(true));
           t.addEventListener('unmute', () => updateCamMuted(false));
         }
+        // Если peer уже прислал media-state до stream'а (race) — применяем его
+        // как initial. Иначе доверяем track.muted.
+        const buffered = peerMediaBufRef.current.get(peerId);
+        const initialCamMuted = buffered ? !buffered.cam : trackCamMuted;
+        const initialMicMuted = buffered ? !buffered.mic : false;
         setPeers((prev) => {
           const next = new Map(prev);
-          next.set(peerId, { stream: remoteStream, name, camMuted: initialCamMuted });
+          next.set(peerId, {
+            stream: remoteStream,
+            name,
+            camMuted: initialCamMuted,
+            micMuted: initialMicMuted,
+          });
           return next;
         });
       },
@@ -871,6 +887,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       },
       onPeerLeft: (peerId) => {
         peerNamesRef.current.delete(peerId);
+        peerMediaBufRef.current.delete(peerId);
         setPeers((prev) => {
           if (!prev.has(peerId)) return prev;
           const next = new Map(prev);
@@ -905,6 +922,26 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         // Может прийти при browser "Stop sharing" — синхронизируем UI.
         setScreenSharing(false);
         setScreenStream(null);
+      },
+      onPeerMediaState: (peerId, state) => {
+        // Удалённый peer broadcast'нул новое cam/mic. Обновляем флаги — это
+        // даёт visual placeholder (аватар вместо застывшего кадра) и
+        // mic-off icon на тайле собеседника.
+        // Буферизуем — если стрим ещё не пришёл, peers.get(peerId) пуст и
+        // мы потеряли бы апдейт. onRemoteStream применит из буфера.
+        peerMediaBufRef.current.set(peerId, { cam: state.cam, mic: state.mic });
+        setPeers((prev) => {
+          const cur = prev.get(peerId);
+          if (!cur) return prev;
+          const camMuted = !state.cam;
+          const micMuted = !state.mic;
+          if ((cur.camMuted ?? false) === camMuted && (cur.micMuted ?? false) === micMuted) {
+            return prev;
+          }
+          const next = new Map(prev);
+          next.set(peerId, { ...cur, camMuted, micMuted });
+          return next;
+        });
       },
     };
 
@@ -1127,6 +1164,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       t.enabled = enabled;
     }
     setMicOn(enabled);
+    // P2P: явно broadcast'им новое state. track.enabled=false НЕ триггерит
+    // track.muted на удалённой стороне, поэтому без этого собеседник не узнает.
+    // Передаём новые значения (camOn для камеры остаётся прежним).
+    p2pConnectionRef.current?.setMediaState({ cam: camOn, mic: enabled });
   };
 
   const handleToggleCam = (): void => {
@@ -1137,6 +1178,8 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       t.enabled = enabled;
     }
     setCamOn(enabled);
+    // См. комментарий в handleToggleMic.
+    p2pConnectionRef.current?.setMediaState({ cam: enabled, mic: micOn });
   };
 
   const handleToggleScreenShare = (): void => {

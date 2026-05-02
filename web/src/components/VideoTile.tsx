@@ -28,7 +28,16 @@ const tileStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+  // Плавный переход свечения при изменении volumeLevel — без него ring
+  // дёргался бы пиксель-в-пиксель на каждый rAF (некрасиво и заметно глазу).
+  transition: 'box-shadow 80ms linear',
 };
+
+// Порог "говорит/не говорит" — среднее frequency-bin значение (0-255).
+// 25 — после noise-suppression в getUserMedia это уверенно отделяет тишину
+// и фоновый шум от речи. Слишком высокий порог = не реагирует на тихую речь;
+// слишком низкий = ring загорается от шороха клавиатуры.
+const SPEAKING_THRESHOLD = 25;
 
 // Placeholder с аватаром накладывается ПОВЕРХ <video> когда камера выключена.
 // position: absolute — чтобы video не размонтировался: srcObject остаётся
@@ -212,6 +221,8 @@ export default function VideoTile({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [hovered, setHovered] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  // 0..100. Используется для box-shadow ring'а — чем громче, тем больше glow.
+  const [volumeLevel, setVolumeLevel] = useState<number>(0);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -219,6 +230,97 @@ export default function VideoTile({
     if (el.srcObject !== stream) {
       el.srcObject = stream;
     }
+  }, [stream]);
+
+  // Audio-уровень через Web Audio API. Создаём AudioContext + AnalyserNode
+  // и в каждом rAF берём средний уровень частот → пишем в state. Если
+  // средний > порога — компонент пульсирует зелёным glow вокруг тайла.
+  //
+  // Screen-share без аудио, или треков ещё нет — ничего не делаем (analyser
+  // не создаём, ring не показывается).
+  //
+  // Локальный тайл (isLocal=true) muted (анти-эхо), но source всё равно
+  // получает данные — пользователь видит индикатор и собственного голоса. Это OK.
+  useEffect(() => {
+    // Если у стрима нет audio-tracks — analyser не нужен.
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      setVolumeLevel(0);
+      return;
+    }
+    // Если все audio-треки muted (нет данных) — тоже ничего не делаем; при
+    // unmute new effect не пере-запустится (зависим только от stream id),
+    // поэтому всё равно пробуем создать analyser — Web Audio с muted track
+    // будет просто давать нули, без ошибок.
+
+    type AudioCtor = typeof AudioContext;
+    const Ctor: AudioCtor | undefined =
+      typeof AudioContext !== 'undefined'
+        ? AudioContext
+        : (window as unknown as { webkitAudioContext?: AudioCtor }).webkitAudioContext;
+    if (!Ctor) return;
+
+    let ctx: AudioContext | null;
+    try {
+      ctx = new Ctor();
+    } catch {
+      // AudioContext requires user gesture — но к моменту рендера VideoTile
+      // пользователь уже нажал "Присоединиться", так что обычно норм. На
+      // случай редких краёв (pre-render) — silently skip.
+      return;
+    }
+
+    let source: MediaStreamAudioSourceNode | null = null;
+    try {
+      source = ctx.createMediaStreamSource(stream);
+    } catch {
+      void ctx.close().catch(() => {});
+      return;
+    }
+
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.7;
+    source.connect(analyser);
+
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    let rafId = 0;
+    let cancelled = false;
+
+    const tick = (): void => {
+      if (cancelled) return;
+      analyser.getByteFrequencyData(buf);
+      // Среднее по всем bin'ам. 0..255.
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] ?? 0;
+      const avg = sum / buf.length;
+      // Маппим 0..255 → 0..100, с лёгким clamp'ом снизу чтобы шум не светился.
+      const level = avg < SPEAKING_THRESHOLD ? 0 : Math.min(100, (avg - SPEAKING_THRESHOLD) * 2);
+      // setState каждый rAF — React 18 батчит, но мы всё равно избегаем
+      // ре-рендера если значение почти то же (округляем до 2 единиц).
+      setVolumeLevel((prev) => (Math.abs(prev - level) < 2 ? prev : level));
+      rafId = window.requestAnimationFrame(tick);
+    };
+    rafId = window.requestAnimationFrame(tick);
+
+    return () => {
+      cancelled = true;
+      if (rafId !== 0) window.cancelAnimationFrame(rafId);
+      try {
+        source?.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        analyser.disconnect();
+      } catch {
+        /* ignore */
+      }
+      // close() возвращает Promise — best-effort.
+      void ctx?.close().catch(() => {
+        /* ignore — context может быть уже closed */
+      });
+    };
   }, [stream]);
 
   // Слушаем глобальный fullscreenchange — пользователь может выйти из
@@ -287,10 +389,25 @@ export default function VideoTile({
     pointerEvents: hovered || isFullscreen ? 'auto' : 'none',
   };
 
+  // Speaking ring — зелёный (accent #22c55e) glow вокруг всего тайла,
+  // расширяется пропорционально volumeLevel (0..100). При тишине — 0px.
+  // Используем два слоя box-shadow: внешний (большой, мягкий) + внутренний
+  // (тонкая чёткая обводка), чтобы и было видно на тёмном фоне, и не
+  // выглядело размыто.
+  const speaking = volumeLevel > 0;
+  const ringSize = speaking ? 4 + volumeLevel / 8 : 0; // 0..16.5px
+  const ringAlpha = speaking ? 0.3 + volumeLevel / 250 : 0; // 0.3..0.7
+  const tileDynamicStyle: CSSProperties = {
+    ...tileStyle,
+    boxShadow: speaking
+      ? `0 0 0 2px rgba(34, 197, 94, ${ringAlpha + 0.2}), 0 0 ${ringSize * 2}px ${ringSize}px rgba(34, 197, 94, ${ringAlpha})`
+      : 'none',
+  };
+
   return (
     <div
       ref={containerRef}
-      style={tileStyle}
+      style={tileDynamicStyle}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >

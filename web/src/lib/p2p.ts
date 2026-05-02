@@ -19,6 +19,18 @@ import { PUBLIC_ICE_SERVERS } from './ice';
 
 export type RemoteStreamKind = 'camera' | 'screen';
 
+// Состояние мьютов на стороне peer'а. true = on, false = off.
+// Передаётся явным action'ом 'media' через data-channel (Trystero) — это
+// единственно надёжный способ узнать, что peer выключил камеру/мик: сам факт
+// `track.enabled = false` НЕ триггерит track.muted/onmute на удалённой стороне.
+//
+// Index-signature нужна чтобы тип удовлетворял Trystero DataPayload (JsonValue).
+export interface P2PMediaState {
+  cam: boolean;
+  mic: boolean;
+  [key: string]: boolean;
+}
+
 export interface P2PMeetEvents {
   onLocalStream(stream: MediaStream): void;
   // kind — 'camera' (default) | 'screen'. Опционален для backwards compat:
@@ -36,6 +48,9 @@ export interface P2PMeetEvents {
   // Локальный screen-share API (mirror MeetConnection events).
   onScreenShareStarted?(stream: MediaStream): void;
   onScreenShareStopped?(): void;
+  // Удалённый peer обновил cam/mic state. Используется для отрисовки
+  // placeholder'а с аватаром (вместо последнего «застывшего» кадра).
+  onPeerMediaState?(peerId: string, state: P2PMediaState): void;
 }
 
 const APP_ID = 'zubrameet';
@@ -59,6 +74,16 @@ export class P2PMeetConnection {
   private room: Room | null = null;
 
   private sendName: ActionSender<NamePayload> | null = null;
+  // 'media' action — broadcast cam/mic state. Запоминаем отправлятор чтобы
+  // setMediaState() мог его дёрнуть.
+  private sendMediaState: ActionSender<P2PMediaState> | null = null;
+  // Текущее локальное cam/mic state. По умолчанию обе включены — это
+  // отражает поведение acquireMedia + setMicOn(true)/setCamOn(true) в Meeting.tsx.
+  private localMediaState: P2PMediaState = { cam: true, mic: true };
+  // peerId → последнее известное cam/mic state. Кешируем чтобы повторные
+  // отправки от того же peer'а не вызывали лишних onPeerMediaState (хотя
+  // потребитель уже умеет diff'ить по prev — это просто дополнительный layer).
+  private readonly peerMediaStates: Map<string, P2PMediaState> = new Map();
   // peerId → display name (может прийти ПОСЛЕ onPeerStream, поэтому буферизуем).
   private readonly peerNames: Map<string, string> = new Map();
   // peerId → MediaStream — храним стримы, чтобы при позднем приходе name
@@ -146,6 +171,38 @@ export class P2PMeetConnection {
         }
       });
 
+      // media-action — broadcast cam/mic mute state. Регистрируем СРАЗУ,
+      // ДО onPeerJoin, чтобы action был готов к отправке вместе с первым
+      // peer'ом (Trystero может пушить ранние сообщения если действие уже
+      // зарегистрировано на момент handshake).
+      const [sendMediaState, getMediaState] =
+        room.makeAction<P2PMediaState>('media');
+      this.sendMediaState = sendMediaState;
+
+      getMediaState((data, peerId) => {
+        try {
+          // Защищаемся от мусора в data-channel (битый payload, кривая версия).
+          if (
+            !data ||
+            typeof data !== 'object' ||
+            typeof (data as P2PMediaState).cam !== 'boolean' ||
+            typeof (data as P2PMediaState).mic !== 'boolean'
+          ) {
+            return;
+          }
+          const state: P2PMediaState = {
+            cam: (data as P2PMediaState).cam,
+            mic: (data as P2PMediaState).mic,
+          };
+          const prev = this.peerMediaStates.get(peerId);
+          if (prev && prev.cam === state.cam && prev.mic === state.mic) return;
+          this.peerMediaStates.set(peerId, state);
+          this.events.onPeerMediaState?.(peerId, state);
+        } catch (err) {
+          this.reportError(err, 'getMediaState');
+        }
+      });
+
       // Сохраняем локальный stream — onPeerJoin будет пушить его новым
       // peer'ам. Trystero v0.24 НЕ реплеит ранее добавленные стримы автоматом.
       this.cameraStream = localStream;
@@ -179,6 +236,17 @@ export class P2PMeetConnection {
             void this.sendName(this.displayName, peerId).catch((err: unknown) => {
               this.reportError(err, 'sendName(onPeerJoin)');
             });
+          }
+          // КРИТИЧНО: сразу шлём текущее cam/mic state новому peer'у. Если мы
+          // зашли с выключенной камерой и кто-то заходит позже — без этого он
+          // увидел бы у нас «track есть, но кадров нет» = чёрный экран без
+          // аватара. Trystero не реплеит ранние action-payload'ы.
+          if (this.sendMediaState) {
+            void this.sendMediaState(this.localMediaState, peerId).catch(
+              (err: unknown) => {
+                this.reportError(err, 'sendMediaState(onPeerJoin)');
+              },
+            );
           }
           // КРИТИЧНО: пушим основной camera+mic stream новому peer'у.
           // Trystero v0.24 НЕ реплеит ранее добавленные стримы — без этого
@@ -229,6 +297,7 @@ export class P2PMeetConnection {
         try {
           this.peerNames.delete(peerId);
           this.peerStreams.delete(peerId);
+          this.peerMediaStates.delete(peerId);
           this.trackedPCs.delete(peerId);
           this.events.onPeerLeft(peerId);
         } catch (err) {
@@ -350,6 +419,42 @@ export class P2PMeetConnection {
     }
   }
 
+  // ─── media state ──────────────────────────────────────────────────────────
+
+  /**
+   * Обновляет локальное cam/mic state и broadcast'ит всем peer'ам через
+   * 'media' action. Вызывать сразу ПОСЛЕ track.enabled = ... в Meeting.tsx.
+   *
+   * Идемпотентен: если state не менялся — broadcast всё равно идёт (на случай
+   * если у peer'а потерялся data-channel-message; стоимость пакета — десяток
+   * байт, дешевле чем долго искать "почему собеседник не видит mute").
+   *
+   * Если start() ещё не отработал (сценарий «нажали mic toggle до того, как
+   * Trystero room поднялся») — просто запоминаем localMediaState; первый
+   * onPeerJoin отправит свежее значение новому peer'у.
+   */
+  setMediaState(state: P2PMediaState): void {
+    this.localMediaState = { cam: state.cam, mic: state.mic };
+    if (!this.sendMediaState) {
+      // Action ещё не зарегистрирован (start() в процессе). Свежее значение
+      // отправится при первом onPeerJoin через sendMediaState(localMediaState).
+      return;
+    }
+    try {
+      // Без второго аргумента → broadcast всем peer'ам Trystero. Возвращает
+      // Promise<void[]> (один на всех). Просто .catch — если у одного peer'а
+      // отвалилось, остальным сообщение всё равно ушло.
+      const result: unknown = this.sendMediaState(this.localMediaState);
+      if (result && typeof (result as Promise<unknown>).then === 'function') {
+        (result as Promise<unknown>).catch((err: unknown) => {
+          this.reportError(err, 'sendMediaState(broadcast)');
+        });
+      }
+    } catch (err) {
+      this.reportError(err, 'sendMediaState(broadcast)');
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -370,9 +475,11 @@ export class P2PMeetConnection {
     const room = this.room;
     this.room = null;
     this.sendName = null;
+    this.sendMediaState = null;
     this.cameraStream = null;
     this.peerNames.clear();
     this.peerStreams.clear();
+    this.peerMediaStates.clear();
     this.trackedPCs.clear();
 
     if (room) {
