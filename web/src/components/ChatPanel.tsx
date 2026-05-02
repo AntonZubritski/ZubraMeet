@@ -1,6 +1,11 @@
 // Правый чат-sidebar (overlay поверх grid'а). На десктопе — фиксированная
-// панель шириной 320px справа. На мобиле (window.innerWidth < 720) — bottom
-// drawer с slideUp-анимацией.
+// карточка справа, не перекрывающая header (top:56) и Controls (bottom:100),
+// с borderRadius:12 и усиленной тенью. На мобиле — bottom drawer 60vh
+// с padding-bottom под Controls.
+//
+// Mount/unmount по chatOpen в Meeting.tsx; пока открыт — idle-таймер
+// chrome'а отключён, так что панель не «уезжает» сама. prop `hidden` снят
+// (см. историю — больше не нужен, мы управляем через mount/unmount).
 //
 // Список сообщений: автоскролл вниз при добавлении нового. URL в тексте
 // автоматически превращаются в кликабельные ссылки.
@@ -15,6 +20,7 @@ import {
   type ReactNode,
 } from 'react';
 import Avatar from 'boring-avatars';
+import EmojiPicker from './EmojiPicker';
 const AVATAR_COLORS = ['#22c55e', '#06b6d4', '#fbbf24', '#ec4899', '#6366f1'];
 
 const MOBILE_BREAKPOINT = 720;
@@ -36,10 +42,11 @@ interface Props {
   messages: ChatPanelMessage[];
   onSend(text: string): void;
   onClose(): void;
-  // Hidden — синхронно с chromeVisible: панель уезжает за край вместе с
-  // header/Controls по idle-таймеру. Не размонтируем — чтобы не терять
-  // непрочитанный input в textarea.
-  hidden?: boolean;
+  // customerId прокидывается в EmojiPicker (опционально). Не используется
+  // для emoji-only mode, но если родитель передал — будет использован
+  // только для GIF-tab; здесь, в чат-picker'е, GIF-tab принципиально
+  // отключён: чат — только текст и emoji.
+  customerId?: string;
 }
 
 function useIsMobile(): boolean {
@@ -103,9 +110,10 @@ function renderTextWithLinks(text: string): ReactNode[] {
   return parts;
 }
 
-export default function ChatPanel({ messages, onSend, onClose, hidden = false }: Props) {
+export default function ChatPanel({ messages, onSend, onClose }: Props) {
   const isMobile = useIsMobile();
   const [input, setInput] = useState<string>('');
+  const [pickerOpen, setPickerOpen] = useState<boolean>(false);
   const listRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -119,14 +127,22 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
 
   // Esc внутри панели → закрыть. Только когда фокус на textarea (ниже
   // в onKeyDown) — здесь global-listener чтобы Esc работал даже если фокус
-  // ушёл на body.
+  // ушёл на body. Если открыт emoji-picker, его внутренний Escape-listener
+  // обрабатывает раньше; здесь Esc закроет ВЕСЬ чат, так что pickerOpen
+  // тоже сбрасываем сразу.
   useEffect(() => {
     const onKey = (ev: KeyboardEvent): void => {
-      if (ev.key === 'Escape') onClose();
+      if (ev.key === 'Escape') {
+        if (pickerOpen) {
+          setPickerOpen(false);
+          return;
+        }
+        onClose();
+      }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, [onClose, pickerOpen]);
 
   const handleSubmit = (): void => {
     const text = input.trim();
@@ -146,6 +162,28 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
     }
   };
 
+  // Вставка emoji в позицию каретки в textarea, без закрытия picker'а
+  // (юзер может натыкать несколько подряд). После вставки — восстанавливаем
+  // позицию каретки за вставленным символом.
+  const insertAtCaret = (emoji: string): void => {
+    const ta = textareaRef.current;
+    if (!ta) {
+      setInput((v) => v + emoji);
+      return;
+    }
+    const start = ta.selectionStart ?? input.length;
+    const end = ta.selectionEnd ?? input.length;
+    const next = input.slice(0, start) + emoji + input.slice(end);
+    setInput(next);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      const pos = start + emoji.length;
+      el.focus();
+      el.setSelectionRange(pos, pos);
+    });
+  };
+
   const containerStyle: CSSProperties = useMemo(() => {
     const base: CSSProperties = {
       position: 'fixed',
@@ -154,13 +192,10 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
       flexDirection: 'column',
       zIndex: 50,
       transition: 'transform 250ms ease, opacity 250ms ease',
-      // По спеку — вместе с chrome'ом скрываемся.
-      opacity: hidden ? 0 : 1,
-      pointerEvents: hidden ? 'none' : 'auto',
     };
     if (isMobile) {
       // Bottom drawer: 60% высоты, slideUp при открытии. С учётом safe-area
-      // нижней (iOS home-indicator).
+      // нижней (iOS home-indicator) + 80px чтобы не перекрывать Controls.
       return {
         ...base,
         left: 0,
@@ -171,22 +206,25 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
         borderTop: '1px solid var(--border)',
         borderTopLeftRadius: 14,
         borderTopRightRadius: 14,
-        paddingBottom: 'env(safe-area-inset-bottom)',
-        transform: hidden ? 'translateY(100%)' : 'translateY(0)',
+        paddingBottom: 'calc(env(safe-area-inset-bottom) + 80px)',
         boxShadow: '0 -8px 24px rgba(0, 0, 0, 0.4)',
       };
     }
+    // Desktop overlay-карточка: вписана между header (top 56) и Controls
+    // (bottom ~100). Усиленная тень и скруглённые углы по всему периметру.
     return {
       ...base,
-      right: 0,
-      top: 0,
-      bottom: 0,
+      right: 16,
+      top: 56,
+      bottom: 100,
       width: 320,
-      borderLeft: '1px solid var(--border)',
-      transform: hidden ? 'translateX(100%)' : 'translateX(0)',
-      boxShadow: '-8px 0 24px rgba(0, 0, 0, 0.3)',
+      maxHeight: 'calc(100dvh - 56px - 100px)',
+      border: '1px solid var(--border)',
+      borderRadius: 12,
+      boxShadow: '0 12px 40px rgba(0, 0, 0, 0.5)',
+      overflow: 'hidden',
     };
-  }, [isMobile, hidden]);
+  }, [isMobile]);
 
   const headerStyle: CSSProperties = {
     display: 'flex',
@@ -239,6 +277,9 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
     lineHeight: 1.5,
   };
 
+  // position:relative нужен чтобы абсолютно позиционированный picker
+  // (bottom: calc(100% + 8px), right: 0) встал ОТНОСИТЕЛЬНО footer'а
+  // и оказался прямо над smile-кнопкой.
   const footerStyle: CSSProperties = {
     display: 'flex',
     gap: 8,
@@ -246,6 +287,25 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
     borderTop: '1px solid var(--border)',
     flexShrink: 0,
     alignItems: 'flex-end',
+    position: 'relative',
+  };
+
+  const emojiBtnStyle: CSSProperties = {
+    width: 32,
+    height: 32,
+    flexShrink: 0,
+    border: '1px solid var(--border)',
+    background: pickerOpen ? 'var(--accent)' : 'var(--bg)',
+    color: pickerOpen ? '#0a0a0a' : 'var(--fg)',
+    borderRadius: 8,
+    cursor: 'pointer',
+    fontSize: 18,
+    lineHeight: 1,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+    transition: 'background-color 120ms ease, color 120ms ease',
   };
 
   const textareaStyle: CSSProperties = {
@@ -282,7 +342,6 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
       style={containerStyle}
       role="complementary"
       aria-label="Чат встречи"
-      aria-hidden={hidden}
     >
       <div style={headerStyle}>
         <h2 style={titleStyle}>Чат</h2>
@@ -379,6 +438,30 @@ export default function ChatPanel({ messages, onSend, onClose, hidden = false }:
       </div>
 
       <div style={footerStyle}>
+        {/* Emoji-picker над smile-кнопкой. closeOnSelect=false — клик
+            по emoji вставляет его в textarea и оставляет picker открытым,
+            чтобы можно было настукать несколько подряд. GIF-tab здесь не
+            нужен (чат — текст + emoji), поэтому onSelectGif/customerId
+            намеренно не прокинуты. */}
+        {pickerOpen && (
+          <EmojiPicker
+            onSelectEmoji={(e) => {
+              insertAtCaret(e);
+            }}
+            onClose={() => setPickerOpen(false)}
+            closeOnSelect={false}
+          />
+        )}
+        <button
+          type="button"
+          style={emojiBtnStyle}
+          onClick={() => setPickerOpen((v) => !v)}
+          aria-label="Выбрать emoji"
+          aria-expanded={pickerOpen}
+          title="Эмодзи"
+        >
+          <span aria-hidden="true">😀</span>
+        </button>
         <textarea
           ref={textareaRef}
           value={input}

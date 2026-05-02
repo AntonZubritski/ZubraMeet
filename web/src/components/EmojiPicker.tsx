@@ -21,6 +21,12 @@ interface Props {
   // быть передан если onSelectGif задан; иначе игнорируется.
   customerId?: string;
   onClose(): void;
+  // Вызывать ли onClose() сразу после клика по emoji. По умолчанию false —
+  // picker остаётся открытым, и решение о закрытии остаётся за родителем
+  // (как делает Controls.SmileButton: вызывает onClose в своём handler'е).
+  // В чате (ChatPanel) важно чтобы picker НЕ закрывался — юзер набивает
+  // подряд несколько emoji в textarea.
+  closeOnSelect?: boolean;
 }
 
 const EMOJIS: string[] = [
@@ -173,6 +179,7 @@ export default function EmojiPicker({
   onSelectGif,
   customerId,
   onClose,
+  closeOnSelect = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Default 'emoji' — это исторический первый таб; GIF-таб только если
@@ -296,7 +303,10 @@ export default function EmojiPicker({
                 key={e}
                 type="button"
                 style={emojiBtnStyle}
-                onClick={() => onSelectEmoji(e)}
+                onClick={() => {
+                  onSelectEmoji(e);
+                  if (closeOnSelect) onClose();
+                }}
                 onMouseEnter={(ev) => {
                   (ev.currentTarget as HTMLButtonElement).style.background =
                     'rgba(255, 255, 255, 0.08)';

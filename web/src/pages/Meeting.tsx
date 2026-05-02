@@ -588,10 +588,20 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // совсем другой. Любая активность (mousemove/mousedown/touchstart/keydown/
   // wheel) сбрасывает таймер и показывает chrome. На unmount/leave убираем
   // listeners и таймер.
+  //
+  // Пока чат открыт — idle-таймер НЕ активен (юзер пишет сообщение, и было бы
+  // глупо прятать chrome пока он печатает). Просто держим chrome видимым и
+  // ничего не таймим.
   useEffect(() => {
     if (!joined) {
       // На pre-join всегда показываем chrome (если вернёмся в joined-state,
       // эффект перезапустится и снова поставит таймер).
+      setChromeVisible(true);
+      return;
+    }
+
+    if (chatOpen) {
+      // Чат открыт — chrome всегда видим, idle-таймер выключен.
       setChromeVisible(true);
       return;
     }
@@ -630,7 +640,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         window.removeEventListener(ev, arm);
       }
     };
-  }, [joined]);
+  }, [joined, chatOpen]);
 
   // Recover camera/microphone после sleep/wake.
   // Останавливаем старые треки, getUserMedia заново, replaceLocalTracks на publishPC.
@@ -2219,14 +2229,15 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         hidden={!chromeVisible}
       />
 
-      {/* Чат-sidebar. Не размонтируем — чтобы сохранить ввод/историю при
-          закрытии. Visibility — через transform/opacity (см. ChatPanel). */}
+      {/* Чат-sidebar. Mount/unmount по chatOpen — пока открыт, idle-таймер
+          chrome'а выключен (см. effect выше), так что панель никогда не
+          «уезжает» сама. Open/close — обычный mount/unmount. */}
       {chatOpen && (
         <ChatPanel
           messages={chatMessages}
           onSend={handleSendChat}
           onClose={handleToggleChat}
-          hidden={!chromeVisible}
+          customerId={customerIdRef.current}
         />
       )}
 

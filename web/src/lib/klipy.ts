@@ -10,6 +10,11 @@
 // customer_id — стабильный per-user идентификатор, нужен Klipy для analytics
 // и персонализации (формальное требование API). В нашем случае генерируем
 // uuid и держим в localStorage.
+//
+// Парсер ниже намеренно ТОЛЕРАНТНЫЙ: пробуем несколько типичных shape'ов
+// (Klipy, Tenor v2, Giphy), потому что точная форма ответа Klipy менялась
+// и местами не очевидна из их доков. Для дебага оставлен `console.debug`
+// с первыми 500 символами JSON — поможет если структура снова изменится.
 
 const DEFAULT_KEY = 'HxXRXNF0S8aMrKVqgooD4BGpkER9E7XQtWjQBZnySARNFEhEklavGu6ATiuWcvxo';
 const ENV_KEY = (import.meta.env.VITE_KLIPY_API_KEY as string | undefined) ?? '';
@@ -31,87 +36,156 @@ export interface KlipyGif {
   height: number;
 }
 
-interface KlipyVariant {
-  url?: unknown;
-  width?: unknown;
-  height?: unknown;
+// Ищем массив с гифками в типичных shape'ах ответа разных GIF-API.
+// Klipy исторически клал в data.data; некоторые версии — просто data;
+// Tenor v2 — results; Giphy — data (массив).
+function extractItems(json: unknown): unknown[] {
+  if (json === null || typeof json !== 'object') return [];
+  const j = json as Record<string, unknown>;
+  // 1) Klipy: { result: true, data: { data: [...] } }
+  const dataObj = j.data;
+  if (dataObj !== null && typeof dataObj === 'object') {
+    const d = dataObj as Record<string, unknown>;
+    if (Array.isArray(d.data)) return d.data;
+    if (Array.isArray(d.results)) return d.results;
+  }
+  // 2) Klipy alt / Giphy: { data: [...] }
+  if (Array.isArray(j.data)) return j.data;
+  // 3) Tenor v2: { results: [...] }
+  if (Array.isArray(j.results)) return j.results;
+  // 4) Bare массив на верхнем уровне.
+  if (Array.isArray(j)) return j as unknown[];
+  return [];
 }
 
-interface KlipyFile {
-  gif?: {
-    hd?: KlipyVariant;
-    sd?: KlipyVariant;
-    xs?: KlipyVariant;
-  };
+// Безопасное чтение свойства из произвольного значения.
+function pick(obj: unknown, key: string): unknown {
+  if (obj === null || typeof obj !== 'object') return undefined;
+  return (obj as Record<string, unknown>)[key];
 }
 
-interface KlipyItem {
-  id?: unknown;
-  slug?: unknown;
-  title?: unknown;
-  preview?: unknown;
-  file?: KlipyFile;
-}
-
-interface KlipyResponse {
-  result?: unknown;
-  data?: {
-    data?: unknown;
-    has_next?: unknown;
-  };
-}
-
-function variantUrl(v: KlipyVariant | undefined): string {
-  if (!v || typeof v.url !== 'string') return '';
-  // Минимальная защита: только https. fetch вернёт fail позже, но лучше
-  // отфильтровать сразу — особенно для broadcast (URL ходит через mesh
-  // и попадает в <img src> у других участников).
-  if (!v.url.startsWith('https://')) return '';
-  return v.url;
-}
-
-function variantNumber(v: KlipyVariant | undefined, key: 'width' | 'height'): number {
-  if (!v) return 0;
-  const raw = v[key];
-  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return Math.round(raw);
-  if (typeof raw === 'string') {
-    const n = Number(raw);
-    if (Number.isFinite(n) && n > 0) return Math.round(n);
+// Берём число из пары кандидатов (возможно строки от API). Возвращает 0
+// если ни один не валиден.
+function firstPositiveNumber(candidates: unknown[]): number {
+  for (const c of candidates) {
+    if (typeof c === 'number' && Number.isFinite(c) && c > 0) return Math.round(c);
+    if (typeof c === 'string') {
+      const n = Number(c);
+      if (Number.isFinite(n) && n > 0) return Math.round(n);
+    }
   }
   return 0;
 }
 
-function mapItem(item: KlipyItem): KlipyGif | null {
-  const idRaw = item.id ?? item.slug;
-  const id = typeof idRaw === 'string' || typeof idRaw === 'number' ? String(idRaw) : '';
-  if (id.length === 0) return null;
+// Берём первый https-URL из кандидатов.
+function firstHttpsUrl(candidates: unknown[]): string {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.startsWith('https://')) return c;
+  }
+  return '';
+}
 
-  const gif = item.file?.gif;
-  // Preview: предпочитаем item.preview, иначе xs.url, иначе sd.url.
-  let preview =
-    typeof item.preview === 'string' && item.preview.startsWith('https://')
-      ? item.preview
-      : '';
-  if (preview.length === 0) preview = variantUrl(gif?.xs);
-  if (preview.length === 0) preview = variantUrl(gif?.sd);
+// Извлекаем preview/full/width/height из произвольного item'а,
+// перебирая все типовые формы (Klipy file.gif.{xs,sm,sd,md,hd}, Tenor
+// media_formats, Giphy images).
+function extractGifUrl(
+  item: unknown,
+): { preview: string; full: string; width: number; height: number } | null {
+  // Klipy: item.file.gif.{xs,sm,sd,md,hd}.{url,width,height}
+  const file = pick(item, 'file');
+  const gif = pick(file, 'gif');
+  const xs = pick(gif, 'xs');
+  const sm = pick(gif, 'sm');
+  const sd = pick(gif, 'sd');
+  const md = pick(gif, 'md');
+  const hd = pick(gif, 'hd');
+  const previewKlipy = pick(gif, 'preview');
 
-  // Full: предпочитаем sd (компромисс качество/вес), fallback hd, fallback xs.
-  let full = variantUrl(gif?.sd);
-  if (full.length === 0) full = variantUrl(gif?.hd);
-  if (full.length === 0) full = variantUrl(gif?.xs);
+  // Tenor v2: item.media_formats.{tinygif,nanogif,gif,mediumgif}
+  const mf = pick(item, 'media_formats');
+  const tfTiny = pick(mf, 'tinygif');
+  const tfNano = pick(mf, 'nanogif');
+  const tfGif = pick(mf, 'gif');
+  const tfMed = pick(mf, 'mediumgif');
+
+  // Tenor v1: item.media[0].{gif,tinygif,nanogif}.url + dims
+  const mediaArr = pick(item, 'media');
+  const m0 = Array.isArray(mediaArr) && mediaArr.length > 0 ? mediaArr[0] : undefined;
+  const m0Tiny = pick(m0, 'tinygif');
+  const m0Nano = pick(m0, 'nanogif');
+  const m0Gif = pick(m0, 'gif');
+
+  // Giphy: item.images.{fixed_height_small,preview_gif,fixed_height,original}
+  const images = pick(item, 'images');
+  const imgFixSmall = pick(images, 'fixed_height_small');
+  const imgPrevGif = pick(images, 'preview_gif');
+  const imgFix = pick(images, 'fixed_height');
+  const imgOrig = pick(images, 'original');
+
+  const previewCandidates: unknown[] = [
+    pick(xs, 'url'),
+    pick(sm, 'url'),
+    pick(previewKlipy, 'url'),
+    typeof previewKlipy === 'string' ? previewKlipy : undefined,
+    typeof pick(item, 'preview') === 'string' ? pick(item, 'preview') : undefined,
+    pick(tfTiny, 'url'),
+    pick(tfNano, 'url'),
+    pick(m0Tiny, 'url'),
+    pick(m0Nano, 'url'),
+    pick(imgFixSmall, 'url'),
+    pick(imgPrevGif, 'url'),
+  ];
+  const fullCandidates: unknown[] = [
+    pick(sd, 'url'),
+    pick(md, 'url'),
+    pick(hd, 'url'),
+    pick(tfGif, 'url'),
+    pick(tfMed, 'url'),
+    pick(m0Gif, 'url'),
+    pick(imgFix, 'url'),
+    pick(imgOrig, 'url'),
+    pick(xs, 'url'),
+  ];
+
+  // Tenor dims: media_formats.gif.dims = [w, h]
+  const tfGifDims = pick(tfGif, 'dims');
+  const m0GifDims = pick(m0Gif, 'dims');
+  const tfDimsW = Array.isArray(tfGifDims) ? tfGifDims[0] : undefined;
+  const tfDimsH = Array.isArray(tfGifDims) ? tfGifDims[1] : undefined;
+  const m0DimsW = Array.isArray(m0GifDims) ? m0GifDims[0] : undefined;
+  const m0DimsH = Array.isArray(m0GifDims) ? m0GifDims[1] : undefined;
+
+  const widthCandidates: unknown[] = [
+    pick(sd, 'width'),
+    pick(md, 'width'),
+    pick(hd, 'width'),
+    pick(xs, 'width'),
+    tfDimsW,
+    pick(tfGif, 'width'),
+    m0DimsW,
+    pick(imgFix, 'width'),
+    pick(imgOrig, 'width'),
+  ];
+  const heightCandidates: unknown[] = [
+    pick(sd, 'height'),
+    pick(md, 'height'),
+    pick(hd, 'height'),
+    pick(xs, 'height'),
+    tfDimsH,
+    pick(tfGif, 'height'),
+    m0DimsH,
+    pick(imgFix, 'height'),
+    pick(imgOrig, 'height'),
+  ];
+
+  const preview = firstHttpsUrl(previewCandidates);
+  const fullPicked = firstHttpsUrl(fullCandidates);
+  const full = fullPicked.length > 0 ? fullPicked : preview;
+  const width = firstPositiveNumber(widthCandidates) || 320;
+  const height = firstPositiveNumber(heightCandidates) || 240;
 
   if (preview.length === 0 || full.length === 0) return null;
-
-  // Размеры берём из того же variant'а что и full.
-  const sized = gif?.sd && variantUrl(gif.sd) === full ? gif.sd
-    : gif?.hd && variantUrl(gif.hd) === full ? gif.hd
-    : gif?.xs;
-  const width = variantNumber(sized, 'width') || 320;
-  const height = variantNumber(sized, 'height') || 240;
-
-  const title = typeof item.title === 'string' ? item.title : '';
-
-  return { id, title, preview, full, width, height };
+  return { preview, full, width, height };
 }
 
 async function fetchKlipy(url: string, signal?: AbortSignal): Promise<KlipyGif[]> {
@@ -129,16 +203,28 @@ async function fetchKlipy(url: string, signal?: AbortSignal): Promise<KlipyGif[]
   } catch {
     return [];
   }
-  const r = json as KlipyResponse;
-  if (r.result !== true) return [];
-  const arr = r.data?.data;
-  if (!Array.isArray(arr)) return [];
-  const out: KlipyGif[] = [];
-  for (const raw of arr) {
-    const mapped = mapItem(raw as KlipyItem);
-    if (mapped) out.push(mapped);
+  // Diag: помогает быстро понять реальный shape ответа если что-то поломалось
+  // на стороне API. 500 символов хватает для верхнего уровня.
+  try {
+    console.debug('[klipy] response shape:', JSON.stringify(json).slice(0, 500));
+  } catch {
+    /* circular / non-serializable — ignore */
   }
-  return out;
+  const items = extractItems(json);
+  return items
+    .map((item, i): KlipyGif | null => {
+      const u = extractGifUrl(item);
+      if (!u) return null;
+      const idRaw = pick(item, 'id') ?? pick(item, 'slug');
+      const id =
+        typeof idRaw === 'string' || typeof idRaw === 'number'
+          ? String(idRaw)
+          : `gif-${i}`;
+      const titleRaw = pick(item, 'title') ?? pick(item, 'slug');
+      const title = typeof titleRaw === 'string' ? titleRaw : '';
+      return { id, title, ...u };
+    })
+    .filter((g): g is KlipyGif => g !== null);
 }
 
 export async function searchGifs(
