@@ -119,6 +119,19 @@ const inviteBtnStyle: CSSProperties = {
   color: 'var(--fg)',
   fontSize: 12,
   cursor: 'pointer',
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 6,
+  transition: 'background 160ms ease, border-color 160ms ease, color 160ms ease, transform 80ms ease',
+};
+
+// Состояние "только что скопировано" — зелёная заливка + чёрный текст,
+// плюс лёгкий tap-effect через scale.
+const inviteBtnCopiedStyle: CSSProperties = {
+  background: 'var(--accent)',
+  borderColor: 'var(--accent)',
+  color: '#0a0a0a',
+  transform: 'scale(0.97)',
 };
 
 const relayBadgeStyle: CSSProperties = {
@@ -452,6 +465,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [screenSharing, setScreenSharing] = useState<boolean>(false);
+  // Флаг "ссылка только что скопирована" — для визуального feedback'а
+  // на кнопке «Скопировать ссылку» (зелёная подсветка + текст ✓ Скопировано).
+  // Сбрасывается через 1.5с автоматически.
+  const [inviteCopied, setInviteCopied] = useState<boolean>(false);
   // Выбранное пользователем качество демонстрации экрана. Применяется при
   // следующем startScreenShare. Меняется через dropdown в Controls. Во время
   // активной трансляции не меняется (preset фиксируется на старте).
@@ -1417,17 +1434,23 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
 
   const handleCopyInvite = (): void => {
     const url = buildInviteUrl();
+    const showFeedback = (): void => {
+      setInviteCopied(true);
+      window.setTimeout(() => setInviteCopied(false), 1500);
+    };
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       void navigator.clipboard
         .writeText(url)
         .then(() => {
           console.log('[Meeting] invite copied:', url);
+          showFeedback();
         })
         .catch((err: unknown) => {
           console.error('[Meeting] clipboard write failed', err);
         });
     } else {
       console.log('[Meeting] invite link:', url);
+      showFeedback();
     }
   };
 
@@ -1732,8 +1755,32 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
             </span>
           );
         })()}
-        <button type="button" style={inviteBtnStyle} onClick={handleCopyInvite}>
-          Скопировать ссылку
+        <button
+          type="button"
+          style={{ ...inviteBtnStyle, ...(inviteCopied ? inviteBtnCopiedStyle : {}) }}
+          onClick={handleCopyInvite}
+          aria-live="polite"
+        >
+          {inviteCopied ? (
+            <>
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="3"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              Скопировано
+            </>
+          ) : (
+            'Скопировать ссылку'
+          )}
         </button>
       </div>
 
