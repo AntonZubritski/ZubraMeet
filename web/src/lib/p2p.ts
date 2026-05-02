@@ -37,6 +37,25 @@ export interface P2PMediaState {
   [key: string]: boolean;
 }
 
+// Состояние screen-share. Отправляется явно через 'screen-state' action,
+// чтобы receiver мог гарантированно убрать tile при остановке трансляции:
+// onended track-event не всегда доставляется через Trystero (особенно если
+// peer закрывает share через native browser overlay сверху страницы).
+//
+// active=true  → peer начал share (вспомогательная информация, основной
+//                канал передачи самого видео — addStream/onPeerStream)
+// active=false → peer остановил share, receiver удаляет ВСЕ его screen-tiles
+//
+// streamId — id текущего stream'а (для будущей точечной идентификации);
+// если active=false и нет конкретного stream'а, передаём пустую строку.
+// Тип всех полей должен быть совместим с Trystero JsonValue, поэтому
+// optional полей здесь нет — иначе index-signature не сойдётся.
+export interface P2PScreenState {
+  active: boolean;
+  streamId: string;
+  [key: string]: boolean | string;
+}
+
 export interface P2PMeetEvents {
   onLocalStream(stream: MediaStream): void;
   // kind — 'camera' (default) | 'screen'. Опционален для backwards compat:
@@ -57,6 +76,10 @@ export interface P2PMeetEvents {
   // Удалённый peer обновил cam/mic state. Используется для отрисовки
   // placeholder'а с аватаром (вместо последнего «застывшего» кадра).
   onPeerMediaState?(peerId: string, state: P2PMediaState): void;
+  // Удалённый peer явно сообщил о начале/остановке screen-share. Главный
+  // use-case — гарантированный teardown screen-tile при active=false (на
+  // случай, если onended track-event не дошёл до receiver'а).
+  onPeerScreenState?(peerId: string, state: P2PScreenState): void;
 }
 
 const APP_ID = 'zubrameet';
@@ -83,6 +106,9 @@ export class P2PMeetConnection {
   // 'media' action — broadcast cam/mic state. Запоминаем отправлятор чтобы
   // setMediaState() мог его дёрнуть.
   private sendMediaState: ActionSender<P2PMediaState> | null = null;
+  // 'screen-state' action — broadcast {active, streamId?} при старте/остановке
+  // screen-share. Гарантированный teardown даже если onended не доходит.
+  private sendScreenState: ActionSender<P2PScreenState> | null = null;
   // Текущее локальное cam/mic state. По умолчанию обе включены — это
   // отражает поведение acquireMedia + setMicOn(true)/setCamOn(true) в Meeting.tsx.
   private localMediaState: P2PMediaState = { cam: true, mic: true };
@@ -212,6 +238,33 @@ export class P2PMeetConnection {
         }
       });
 
+      // screen-state action — явный teardown-сигнал для screen-share.
+      // Регистрируем сразу после media-action, ДО onPeerJoin/onPeerStream,
+      // чтобы первое сообщение от другого peer'а не потерялось.
+      const [sendScreenState, getScreenState] =
+        room.makeAction<P2PScreenState>('screen-state');
+      this.sendScreenState = sendScreenState;
+
+      getScreenState((data, peerId) => {
+        try {
+          if (
+            !data ||
+            typeof data !== 'object' ||
+            typeof (data as P2PScreenState).active !== 'boolean'
+          ) {
+            return;
+          }
+          const sid = (data as P2PScreenState).streamId;
+          const state: P2PScreenState = {
+            active: (data as P2PScreenState).active,
+            streamId: typeof sid === 'string' ? sid : '',
+          };
+          this.events.onPeerScreenState?.(peerId, state);
+        } catch (err) {
+          this.reportError(err, 'getScreenState');
+        }
+      });
+
       // Сохраняем локальный stream — onPeerJoin будет пушить его новым
       // peer'ам. Trystero v0.24 НЕ реплеит ранее добавленные стримы автоматом.
       this.cameraStream = localStream;
@@ -305,6 +358,16 @@ export class P2PMeetConnection {
             } catch (err) {
               this.reportError(err, 'addStream(screen,newPeer)');
             }
+            // И явный screen-state=true — на случай, если onPeerStream
+            // прилетит раньше, чем receiver-side готов мапить metadata.
+            if (this.sendScreenState) {
+              void this.sendScreenState(
+                { active: true, streamId: this.screenStream.id },
+                peerId,
+              ).catch((err: unknown) => {
+                this.reportError(err, 'sendScreenState(onPeerJoin)');
+              });
+            }
           }
           // Подвешиваемся на connectionstatechange низлежащего PC.
           this.trackPeerPC(peerId);
@@ -385,6 +448,39 @@ export class P2PMeetConnection {
       audio: false,
     });
 
+    // Защита от mirror-loop: пользователь мог через native browser-picker
+    // выбрать саму вкладку ZubraMeet → видео экрана, на котором показано
+    // видео экрана, … (бесконечная рекурсия + ужасный feedback). Чек:
+    //   displaySurface === 'browser' (вкладка, не window/monitor) +
+    //   label содержит наш hostname (Chromium кладёт туда title/URL вкладки).
+    // На Firefox/Safari label может быть пустым — тогда полагаемся только на
+    // displaySurface; ложное срабатывание возможно (любая вкладка), но это
+    // безопаснее чем silently зациклить.
+    const [videoTrack] = stream.getVideoTracks();
+    if (videoTrack) {
+      const settings = videoTrack.getSettings() as MediaTrackSettings & {
+        displaySurface?: string;
+      };
+      const isBrowserTab = settings.displaySurface === 'browser';
+      const labelHasOwnHost =
+        typeof window !== 'undefined' &&
+        videoTrack.label.length > 0 &&
+        videoTrack.label.includes(window.location.hostname);
+      if (isBrowserTab && labelHasOwnHost) {
+        for (const t of stream.getTracks()) {
+          try {
+            t.stop();
+          } catch {
+            /* ignore */
+          }
+        }
+        this.screenPreset = null;
+        throw new Error(
+          'Нельзя демонстрировать саму вкладку ZubraMeet — это создаст бесконечную рекурсию. Выберите другую вкладку, окно или весь экран.',
+        );
+      }
+    }
+
     // Запоминаем до addStream, чтобы onended-handler знал что мы это запустили.
     this.screenStream = stream;
 
@@ -420,6 +516,25 @@ export class P2PMeetConnection {
       }
     } catch (err) {
       this.reportError(err, 'addStream(screen)');
+    }
+
+    // Явный broadcast: peer начал share. Receiver может использовать этот
+    // сигнал для preemptive cleanup старого screen-tile того же peer'а
+    // (если, скажем, peer перезапустил share без чистого stopScreenShare).
+    if (this.sendScreenState) {
+      try {
+        const result: unknown = this.sendScreenState({
+          active: true,
+          streamId: stream.id,
+        });
+        if (result && typeof (result as Promise<unknown>).then === 'function') {
+          (result as Promise<unknown>).catch((err: unknown) => {
+            this.reportError(err, 'sendScreenState(start)');
+          });
+        }
+      } catch (err) {
+        this.reportError(err, 'sendScreenState(start)');
+      }
     }
 
     // Прокатываем encoding-параметры по всем уже трекаемым PC. tuneVideoEncoding
@@ -458,6 +573,28 @@ export class P2PMeetConnection {
     this.screenPreset = null;
 
     const room = this.room;
+
+    // ВАЖНО: явный broadcast active=false ДО removeStream. Это гарантирует
+    // teardown screen-tile у receiver'а даже если onended track-event у него
+    // не сработает (Trystero иногда не доставляет ended при teardown через
+    // native browser overlay). Шлём с streamId, но receiver может игнорить
+    // его и просто чистить все screen-tiles этого peer'а.
+    if (this.sendScreenState) {
+      try {
+        const result: unknown = this.sendScreenState({
+          active: false,
+          streamId: stream.id,
+        });
+        if (result && typeof (result as Promise<unknown>).then === 'function') {
+          (result as Promise<unknown>).catch((err: unknown) => {
+            this.reportError(err, 'sendScreenState(stop)');
+          });
+        }
+      } catch (err) {
+        this.reportError(err, 'sendScreenState(stop)');
+      }
+    }
+
     if (room) {
       try {
         // Trystero room.removeStream возвращает void (см. types.d.mts).
@@ -541,6 +678,7 @@ export class P2PMeetConnection {
     this.room = null;
     this.sendName = null;
     this.sendMediaState = null;
+    this.sendScreenState = null;
     this.cameraStream = null;
     this.peerNames.clear();
     this.peerStreams.clear();

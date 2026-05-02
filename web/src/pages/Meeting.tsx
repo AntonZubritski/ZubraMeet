@@ -184,6 +184,36 @@ const insecureBadgeStyle: CSSProperties = {
   whiteSpace: 'nowrap',
 };
 
+// Жёлтый "ненавязчивый" банер-подсказка на время активной screen-share.
+// Показывается под header'ом — напоминает, что управлять трансляцией нужно
+// через нашу кнопку, а не через native overlay браузера сверху.
+const screenHintStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '6px 12px',
+  background: 'rgba(234, 179, 8, 0.10)',
+  borderBottom: '1px solid rgba(234, 179, 8, 0.30)',
+  color: '#eab308',
+  fontSize: 12,
+  lineHeight: 1.35,
+  flexShrink: 0,
+};
+
+// Красный banner для ошибок screen-share (mirror loop и т.п.).
+const screenErrorStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '8px 12px',
+  background: 'rgba(239, 68, 68, 0.10)',
+  borderBottom: '1px solid rgba(239, 68, 68, 0.40)',
+  color: 'var(--danger)',
+  fontSize: 13,
+  lineHeight: 1.35,
+  flexShrink: 0,
+};
+
 const gridContainerStyle: CSSProperties = {
   flex: 1,
   minHeight: 0,
@@ -454,6 +484,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   const [relayError, setRelayError] = useState<string | null>(null);
   const [, setNowTick] = useState<number>(0);
 
+  // Ошибка screen-share, которую надо показать пользователю (например,
+  // mirror-loop detection). Очищается через таймер.
+  const [screenShareError, setScreenShareError] = useState<string | null>(null);
+
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
   const sfuConnectionRef = useRef<MeetConnection | null>(null);
@@ -468,6 +502,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // ДО onRemoteStream (тогда peers Map ещё не имеет записи и мы бы потеряли
   // апдейт). При создании записи применим буферизованное состояние.
   const peerMediaBufRef = useRef<Map<string, { cam: boolean; mic: boolean }>>(new Map());
+  // Уже виденные remote-screen ключи — чтобы auto-fullscreen-эффект ниже
+  // триггерился только на ВПЕРВЫЕ добавленные screen-tile'ы, а не на любой
+  // ре-рендер remoteScreens (имя обновилось и т.д.).
+  const seenRemoteScreensRef = useRef<Set<string>>(new Set());
   // Чтобы избежать двойной инициализации в StrictMode dev.
   const startedRef = useRef<boolean>(false);
 
@@ -805,11 +843,17 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       onRemoteStream: (peerId, remoteStream, name, kind) => {
         if (kind === 'screen') {
           // Ключ remoteScreens — уникальный per (peerId,streamId). Если пир
-          // пере-расшарит экран, у нового стрима будет другой stream.id, а
-          // старый будет очищен через track.onended ниже / peer-left.
+          // пере-расшарит экран (например, остановил и запустил снова через
+          // native browser overlay), у нового стрима будет другой stream.id.
+          // Чтобы не получить ДВА tile'а от одного peer'а, перед добавлением
+          // нового screen-стрима снимаем все старые от этого же peer'а —
+          // максимум 1 screen-tile на peer.
           const key = `${peerId}:${remoteStream.id}`;
           setRemoteScreens((prev) => {
             const next = new Map(prev);
+            for (const [k, v] of prev) {
+              if (v.peerId === peerId) next.delete(k);
+            }
             next.set(key, { stream: remoteStream, peerName: name, peerId });
             return next;
           });
@@ -950,6 +994,28 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           next.set(peerId, { ...cur, camMuted, micMuted });
           return next;
         });
+      },
+      onPeerScreenState: (peerId, state) => {
+        // Удалённый peer явно сообщил о состоянии своего screen-share.
+        // active=false — гарантированный teardown ВСЕХ его screen-tile'ов.
+        // Это back-up на случай, если track.onended не доставится через
+        // Trystero (происходит, например, когда peer закрывает share через
+        // native browser overlay, а не через нашу кнопку).
+        // active=true — ничего активно не делаем; основной канал — addStream/
+        // onRemoteStream сам прислал и стрим, и metadata.
+        if (!state.active) {
+          setRemoteScreens((prev) => {
+            let changed = false;
+            const next = new Map(prev);
+            for (const [k, v] of prev) {
+              if (v.peerId === peerId) {
+                next.delete(k);
+                changed = true;
+              }
+            }
+            return changed ? next : prev;
+          });
+        }
       },
     };
 
@@ -1117,6 +1183,59 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
     };
   }, [resolvedMode, joined]);
 
+  // Auto-fullscreen для впервые появившегося remote screen-tile.
+  // Browsers требуют user-gesture для requestFullscreen() — поэтому шанс
+  // успеха у этой попытки невелик. Если не получилось — silent skip; у нас
+  // также есть большая overlay-кнопка по центру тайла (см. VideoTile), которая
+  // делает то же самое, но уже от user-gesture (клика).
+  // Также прибираем seenRemoteScreensRef от ключей, которых больше нет.
+  useEffect(() => {
+    const seen = seenRemoteScreensRef.current;
+    // Сначала вычищаем удалённые ключи, чтобы при пересоздании того же
+    // (peerId,streamId) auto-fullscreen сработал снова.
+    for (const key of Array.from(seen)) {
+      if (!remoteScreens.has(key)) seen.delete(key);
+    }
+    // Найти новые.
+    const fresh: string[] = [];
+    for (const key of remoteScreens.keys()) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        fresh.push(key);
+      }
+    }
+    if (fresh.length === 0) return;
+
+    // Пробуем auto-fullscreen для последнего нового тайла. setTimeout — даём
+    // VideoGrid отрендерить DOM.
+    const lastKey = fresh[fresh.length - 1];
+    if (typeof lastKey !== 'string') return;
+    const tileId = `screen-${lastKey}`;
+    const timerId = window.setTimeout(() => {
+      // Не пытаемся, если уже что-то в fullscreen.
+      if (document.fullscreenElement) return;
+      // querySelector с экранированными "опасными" символами в id (на всякий
+      // случай — peerId/streamId UUID-подобные, но мало ли).
+      const safe = (window as unknown as { CSS?: { escape?: (s: string) => string } })
+        .CSS?.escape
+        ? CSS.escape(tileId)
+        : tileId.replace(/"/g, '\\"');
+      const el = document.querySelector(
+        `[data-screen-tile-id="${safe}"]`,
+      ) as HTMLElement | null;
+      if (!el) return;
+      const req = el.requestFullscreen?.bind(el);
+      if (!req) return;
+      void req().catch(() => {
+        // Browser обычно блокирует без user-gesture — это ожидаемо.
+        // У VideoTile есть большая overlay-кнопка для ручного fullscreen.
+      });
+    }, 200);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [remoteScreens]);
+
   const handleRecheck = (): void => {
     if (rechecking) return;
     setRechecking(true);
@@ -1213,6 +1332,8 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           setScreenStream(null);
         });
     } else {
+      // Пред-отчищаем ошибку — если повторно жмём после mirror-loop reject.
+      setScreenShareError(null);
       void conn
         .startScreenShare(screenQuality)
         .then((s) => {
@@ -1225,7 +1346,14 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           if (name === 'NotAllowedError' || name === 'AbortError') {
             return;
           }
+          // Mirror-loop reject прилетает обычным Error (не DOMException) с
+          // нашим message. Показываем юзеру в UI; auto-clear через 8 сек.
+          const msg = err instanceof Error ? err.message : String(err);
           console.error('[Meeting] startScreenShare failed', err);
+          setScreenShareError(msg);
+          window.setTimeout(() => {
+            setScreenShareError((cur) => (cur === msg ? null : cur));
+          }, 8000);
         });
     }
   };
@@ -1608,6 +1736,39 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           Скопировать ссылку
         </button>
       </div>
+
+      {screenSharing && (
+        <div style={screenHintStyle} role="status" aria-live="polite">
+          <span aria-hidden="true">🖥</span>
+          <span>
+            Вы демонстрируете экран. Управляйте трансляцией кнопкой в
+            панели снизу — баннер браузера сверху может выключить её
+            некорректно (тайл застрянет у собеседников).
+          </span>
+        </div>
+      )}
+
+      {screenShareError && (
+        <div style={screenErrorStyle} role="alert" aria-live="assertive">
+          <span aria-hidden="true">⚠️</span>
+          <span style={{ flex: 1 }}>{screenShareError}</span>
+          <button
+            type="button"
+            onClick={() => setScreenShareError(null)}
+            style={{
+              background: 'transparent',
+              border: '1px solid currentColor',
+              color: 'inherit',
+              borderRadius: 4,
+              padding: '2px 8px',
+              fontSize: 11,
+              cursor: 'pointer',
+            }}
+          >
+            Скрыть
+          </button>
+        </div>
+      )}
 
       {showSharePanel && (
         <div style={{ padding: '10px 16px', flexShrink: 0 }}>

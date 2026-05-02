@@ -113,6 +113,7 @@ function Tile({ tile }: TileProps) {
       camMuted={tile.camMuted}
       isScreen={tile.isScreen}
       isLocalScreen={tile.isLocalScreen}
+      tileId={tile.id}
     />
   );
 }

@@ -15,6 +15,10 @@ interface Props {
   // для screen-share нужно objectFit: contain (а не cover) и подпись.
   isScreen?: boolean;
   isLocalScreen?: boolean;
+  // ID тайла, прокинутый из VideoGrid. Когда isScreen=true и !isLocalScreen,
+  // используется как data-screen-tile-id, чтобы Meeting.tsx мог найти DOM-узел
+  // и попытаться вызвать requestFullscreen() при появлении нового remote screen.
+  tileId?: string;
 }
 
 const tileStyle: CSSProperties = {
@@ -159,6 +163,61 @@ const fullscreenBtnBaseStyle: CSSProperties = {
   transition: 'opacity 120ms ease',
 };
 
+// PiP-кнопка — слева от fullscreen-кнопки, только для screen-tile'ов.
+const pipBtnBaseStyle: CSSProperties = {
+  position: 'absolute',
+  top: 8,
+  right: 44, // слева от fullscreen (8 + 28 + 8 gap)
+  width: 28,
+  height: 28,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background: 'rgba(0, 0, 0, 0.55)',
+  border: 'none',
+  borderRadius: 6,
+  color: 'var(--fg)',
+  cursor: 'pointer',
+  padding: 0,
+  transition: 'opacity 120ms ease',
+};
+
+// Большая overlay-кнопка, которая лежит ПО ЦЕНТРУ remote screen-tile'а
+// когда он не в fullscreen. Цель: дать пользователю user gesture, через
+// который можно вызвать requestFullscreen() — это скрывает browser chrome
+// и баннер «Демонстрировать вкладку» сверху.
+const fullscreenOverlayStyle: CSSProperties = {
+  position: 'absolute',
+  inset: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background: 'transparent',
+  border: 'none',
+  cursor: 'pointer',
+  padding: 0,
+  // pointerEvents 'auto' — кнопка перехватывает клик. По дизайну она почти
+  // прозрачная, но при hover проявляется centered pill с подсказкой.
+  pointerEvents: 'auto',
+};
+
+const fullscreenOverlayPillStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '10px 16px',
+  background: 'rgba(0, 0, 0, 0.65)',
+  borderRadius: 999,
+  color: '#fff',
+  fontSize: 13,
+  fontWeight: 500,
+  pointerEvents: 'none',
+  border: '1px solid rgba(255, 255, 255, 0.18)',
+  backdropFilter: 'blur(4px)',
+  WebkitBackdropFilter: 'blur(4px)',
+  transition: 'transform 160ms ease, opacity 160ms ease',
+};
+
 function MicOffIcon() {
   return (
     <svg
@@ -205,6 +264,27 @@ function FullscreenEnterIcon() {
   );
 }
 
+// Picture-in-picture icon — большой прямоугольник + маленький в углу.
+// Используется для screen-share, чтобы вынести презентацию в плавающее окно.
+function PipIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="3" y="5" width="18" height="14" rx="2" ry="2" />
+      <rect x="13" y="11" width="6" height="5" rx="1" ry="1" fill="currentColor" />
+    </svg>
+  );
+}
+
 // 4 уголка внутрь — «свернуть».
 function FullscreenExitIcon() {
   return (
@@ -235,6 +315,7 @@ export default function VideoTile({
   camMuted = false,
   isScreen = false,
   isLocalScreen = false,
+  tileId,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -396,6 +477,35 @@ export default function VideoTile({
     });
   };
 
+  // PiP. Полезно только для screen-share — выносит презентацию в плавающее
+  // окно поверх других приложений. Для камер мы PiP запрещаем (см.
+  // disablePictureInPicture ниже), потому что кнопка PiP в нативных controls
+  // выглядит как кнопка-промах рядом со screen-share.
+  const handleTogglePip = (e: React.MouseEvent): void => {
+    e.stopPropagation();
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          requestPictureInPicture?: () => Promise<unknown>;
+        })
+      | null;
+    if (!video) return;
+    const doc = document as Document & {
+      pictureInPictureElement?: Element | null;
+      exitPictureInPicture?: () => Promise<void>;
+    };
+    if (doc.pictureInPictureElement === video && doc.exitPictureInPicture) {
+      void doc.exitPictureInPicture().catch((err: unknown) => {
+        console.error('[VideoTile] exitPictureInPicture failed', err);
+      });
+      return;
+    }
+    if (typeof video.requestPictureInPicture === 'function') {
+      void video.requestPictureInPicture().catch((err: unknown) => {
+        console.error('[VideoTile] requestPictureInPicture failed', err);
+      });
+    }
+  };
+
   // Для screen-share не обрезаем (objectFit: contain), для камеры — cover.
   const videoStyle: CSSProperties = {
     width: '100%',
@@ -418,14 +528,33 @@ export default function VideoTile({
     pointerEvents: hovered || isFullscreen ? 'auto' : 'none',
   };
 
+  // PiP-кнопка показывается только на screen-tile'ах (камеры — без PiP).
+  const pipBtnStyle: CSSProperties = {
+    ...pipBtnBaseStyle,
+    opacity: hovered || isFullscreen ? 1 : 0,
+    pointerEvents: hovered || isFullscreen ? 'auto' : 'none',
+  };
+
+  // Показываем "большую" overlay-кнопку только на REMOTE screen-tile'ах
+  // (не на нашем собственном — у себя fullscreen скроет лишь наше же видео).
+  // И только пока тайл не в fullscreen.
+  const showFullscreenOverlay =
+    isScreen && !isLocalScreen && !isFullscreen;
+
   // Talking visualization — концентрические круги расходящиеся от аватара,
   // как круги на воде. Реализовано через 3 absolute div'а с CSS animation;
   // play-state ставим в paused когда volumeLevel === 0 (тишина).
   const speaking = volumeLevel > 0;
 
+  // data-attribute для screen-tile'ов — Meeting.tsx использует, чтобы найти
+  // конкретный DOM-узел при появлении нового remote screen и попытаться
+  // вызвать requestFullscreen() (а заодно для дебага/тестов).
+  const dataScreenTileId = isScreen && tileId ? tileId : undefined;
+
   return (
     <div
       ref={containerRef}
+      data-screen-tile-id={dataScreenTileId}
       style={{
         ...tileStyle,
         // Когда говорит и камера ON — мягкая зелёная обводка вокруг тайла
@@ -445,19 +574,27 @@ export default function VideoTile({
           просто накладываем placeholder сверху — video продолжает жить и
           мгновенно появляется при включении (без re-attach stream).
 
-          Атрибуты гасят браузерные controls которые появляются на
-          fullscreen видео в Chrome/Brave (PiP, Cast/Share-tab, download,
-          remote-playback) — иначе зритель случайно жмёт "Поделиться этой
-          вкладкой" и стартует свой screen-share. */}
+          Для камер: disablePictureInPicture + nofullscreen в controlsList,
+          чтобы зритель в нативном меню браузера не тыкнул случайно «PiP» или
+          «Share this tab» и не стартанул свой screen-share.
+
+          Для screen-share PiP, наоборот, ПОЛЕЗЕН — даёт вынести презентацию
+          в плавающее окно поверх других приложений. Поэтому для isScreen=true
+          мы НЕ ставим disablePictureInPicture и убираем nopictureinpicture
+          из controlsList. */}
       <video
         ref={videoRef}
         style={videoStyle}
         autoPlay
         playsInline
         muted={isLocal || micMuted}
-        disablePictureInPicture
+        {...(isScreen ? {} : { disablePictureInPicture: true })}
         disableRemotePlayback
-        controlsList="nodownload nofullscreen noremoteplayback noplaybackrate"
+        controlsList={
+          isScreen
+            ? 'nodownload nofullscreen noremoteplayback noplaybackrate'
+            : 'nodownload nofullscreen noremoteplayback noplaybackrate'
+        }
       />
       {camMuted && (
         <div style={placeholderStyle} aria-label={`Камера выключена: ${name}`}>
@@ -495,6 +632,18 @@ export default function VideoTile({
         </div>
       )}
 
+      {isScreen && (
+        <button
+          type="button"
+          style={pipBtnStyle}
+          onClick={handleTogglePip}
+          title="Картинка в картинке"
+          aria-label="Открыть в режиме «картинка в картинке»"
+        >
+          <PipIcon />
+        </button>
+      )}
+
       <button
         type="button"
         style={fullscreenBtnStyle}
@@ -504,6 +653,33 @@ export default function VideoTile({
       >
         {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
       </button>
+
+      {showFullscreenOverlay && (
+        // Большая прозрачная кнопка по центру тайла. При клике даёт user-gesture
+        // → надёжный requestFullscreen(), который скрывает баннер браузера
+        // «Демонстрировать вкладку» и весь chrome.
+        // Не перехватывает клик за пределами центральной pill'ы — оставляем
+        // верхне-правые управляющие кнопки доступными (они z-index'ом выше
+        // не нужны, потому что физически расположены поверх).
+        <button
+          type="button"
+          style={fullscreenOverlayStyle}
+          onClick={handleToggleFullscreen}
+          aria-label="Открыть на весь экран — скроет баннер браузера"
+          title="Открыть на весь экран — скроет баннер браузера"
+        >
+          <span
+            style={{
+              ...fullscreenOverlayPillStyle,
+              opacity: hovered ? 1 : 0.85,
+              transform: hovered ? 'scale(1.04)' : 'scale(1)',
+            }}
+          >
+            <FullscreenEnterIcon />
+            <span>Открыть на весь экран — скроет баннер браузера</span>
+          </span>
+        </button>
+      )}
     </div>
   );
 }

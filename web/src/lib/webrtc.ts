@@ -229,6 +229,34 @@ export class MeetConnection {
       audio: false,
     });
 
+    // Защита от mirror-loop: пользователь мог через native browser-picker
+    // выбрать саму вкладку ZubraMeet → бесконечная рекурсия видео-в-видео.
+    // Чек: displaySurface === 'browser' (вкладка) + label содержит наш hostname.
+    // На Firefox/Safari label иногда пуст — тогда полагаемся только на displaySurface.
+    const [videoTrack] = stream.getVideoTracks();
+    if (videoTrack) {
+      const settings = videoTrack.getSettings() as MediaTrackSettings & {
+        displaySurface?: string;
+      };
+      const isBrowserTab = settings.displaySurface === 'browser';
+      const labelHasOwnHost =
+        typeof window !== 'undefined' &&
+        videoTrack.label.length > 0 &&
+        videoTrack.label.includes(window.location.hostname);
+      if (isBrowserTab && labelHasOwnHost) {
+        for (const t of stream.getTracks()) {
+          try {
+            t.stop();
+          } catch {
+            /* ignore */
+          }
+        }
+        throw new Error(
+          'Нельзя демонстрировать саму вкладку ZubraMeet — это создаст бесконечную рекурсию. Выберите другую вкладку, окно или весь экран.',
+        );
+      }
+    }
+
     // Запоминаем до renegotiate, чтобы отслеживать onended даже если SDP-обмен фейлит.
     this.screenStream = stream;
 

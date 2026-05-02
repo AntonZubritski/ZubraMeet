@@ -366,6 +366,12 @@ function ScreenShareControl({
   if (variant === 'active') {
     mainStyle = {
       ...mainBase,
+      // Когда трансляция активна — закругляем правую сторону тоже, потому что
+      // chevron-tab превратится в неактивную (см. ниже) и визуально лучше,
+      // если он смотрится как отдельная "пилюля", а не приклеен к main.
+      borderTopRightRadius: 999,
+      borderBottomRightRadius: 999,
+      borderRight: '1px solid var(--accent)',
       background: 'var(--accent)',
       borderColor: 'var(--accent)',
       color: '#0a0a0a',
@@ -378,21 +384,33 @@ function ScreenShareControl({
     };
   }
 
+  // Chevron-tab. Когда screen-share АКТИВЕН — рисуем disabled-вариант
+  // (видимый, но неактивный) с tooltip-подсказкой, что качество поменять
+  // нельзя на лету. Так пользователь не теряет визуальный контекст
+  // ("куда делась стрелка?") и понимает, что нужно сначала остановить.
+  const chevDisabled = active;
   const chevStyle: CSSProperties = {
     width: 22,
     height: 48,
+    marginLeft: chevDisabled ? 4 : 0,
+    borderRadius: chevDisabled ? 999 : 0,
     borderTopRightRadius: 999,
     borderBottomRightRadius: 999,
     border: '1px solid var(--border)',
-    borderLeft: 'none',
-    background: chevHovered ? '#1f1f1f' : 'var(--panel)',
-    color: 'var(--fg)',
+    borderLeft: chevDisabled ? '1px solid var(--border)' : 'none',
+    background: chevDisabled
+      ? 'var(--panel)'
+      : chevHovered
+        ? '#1f1f1f'
+        : 'var(--panel)',
+    color: chevDisabled ? 'var(--muted)' : 'var(--fg)',
+    opacity: chevDisabled ? 0.55 : 1,
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
-    cursor: 'pointer',
+    cursor: chevDisabled ? 'not-allowed' : 'pointer',
     padding: 0,
-    transition: 'background-color 120ms ease, border-color 120ms ease',
+    transition: 'background-color 120ms ease, border-color 120ms ease, opacity 120ms ease',
   };
 
   const dropdownStyle: CSSProperties = {
@@ -464,23 +482,33 @@ function ScreenShareControl({
         <ScreenShareIcon active={active} />
       </button>
 
-      {!active && (
-        <button
-          type="button"
-          style={chevStyle}
-          onClick={() => setOpen((v) => !v)}
-          onMouseEnter={() => setChevHovered(true)}
-          onMouseLeave={() => setChevHovered(false)}
-          onFocus={() => setChevHovered(true)}
-          onBlur={() => setChevHovered(false)}
-          aria-label="Выбрать качество трансляции"
-          aria-haspopup="listbox"
-          aria-expanded={open}
-          title="Выбрать качество"
-        >
-          <ChevronUpIcon />
-        </button>
-      )}
+      <button
+        type="button"
+        style={chevStyle}
+        onClick={() => {
+          if (chevDisabled) return;
+          setOpen((v) => !v);
+        }}
+        onMouseEnter={() => setChevHovered(true)}
+        onMouseLeave={() => setChevHovered(false)}
+        onFocus={() => setChevHovered(true)}
+        onBlur={() => setChevHovered(false)}
+        aria-label={
+          chevDisabled
+            ? 'Качество нельзя менять во время трансляции — остановите её сначала'
+            : 'Выбрать качество трансляции'
+        }
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-disabled={chevDisabled}
+        title={
+          chevDisabled
+            ? 'Сначала остановите текущую трансляцию, чтобы сменить качество'
+            : 'Выбрать качество'
+        }
+      >
+        <ChevronUpIcon />
+      </button>
 
       {open && !active && (
         <div role="listbox" aria-label="Качество трансляции экрана" style={dropdownStyle}>
