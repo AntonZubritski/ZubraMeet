@@ -174,9 +174,28 @@ export class P2PMeetConnection {
         // password (если задан): Trystero шифрует ВЁС signaling через Nostr-relays
         // и data-channel сообщения. Peer без правильного password не сможет
         // расшифровать SDP/ICE → peer-connection не установится.
-        const config: { appId: string; rtcConfig: { iceServers: typeof PUBLIC_ICE_SERVERS }; password?: string } = {
+        //
+        // relayUrls: явный список стабильных публичных Nostr-relay'ев. Default
+        // у Trystero включает relay.nostr.place у которого жёсткий rate-limit
+        // ("you are noting too much") — peer'ы НЕ находят друг друга если
+        // оба попадают на этот relay. Передаём свой список из давно работающих
+        // и распределённых nodes — увеличивает шанс что хотя бы один доступен.
+        const config: {
+          appId: string;
+          rtcConfig: { iceServers: typeof PUBLIC_ICE_SERVERS };
+          password?: string;
+          relayUrls?: string[];
+        } = {
           appId: APP_ID,
           rtcConfig: { iceServers: PUBLIC_ICE_SERVERS },
+          relayUrls: [
+            'wss://relay.damus.io',
+            'wss://nos.lol',
+            'wss://nostr.wine',
+            'wss://relay.nostr.band',
+            'wss://relay.snort.social',
+            'wss://relay.primal.net',
+          ],
         };
         if (this.password) {
           config.password = this.password;
