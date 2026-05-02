@@ -1927,7 +1927,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
     <div style={pageStyle}>
       <div style={headerDynamicStyle}>
         <h1 style={titleStyle}>
-          Мит <span style={roomIdStyle}>{roomId}</span>
+          <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" style={brandLogoStyle} />
+          <span style={brandTextStyle}>ZubraMeet</span>
+          <span style={roomIdStyle} title={`ID мита: ${roomId}`}>{roomId}</span>
         </h1>
         <span style={modeBadgeStyle} data-tip={modeBadgeTitle}>
           {modeBadgeLabel}
