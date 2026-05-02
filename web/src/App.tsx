@@ -55,18 +55,30 @@ function readHashPassword(): string | undefined {
   return raw.length > 0 ? raw : undefined;
 }
 
+// Нормализация roomId для Crockford base32: uppercase + замена символов
+// похожих на цифры (I→1, L→1, O→0, U→V). Это спасает от ручного ввода с
+// опечаткой и от случаев когда мессенджер делает auto-correct в URL.
+function normalizeRoomId(raw: string): string {
+  return raw
+    .toUpperCase()
+    .replace(/I/g, '1')
+    .replace(/L/g, '1')
+    .replace(/O/g, '0')
+    .replace(/U/g, 'V');
+}
+
 function parseRoute(path: string): RouteMatch | null {
   const password = readHashPassword();
   // /p2p/<roomId> — принудительно P2P. Проверяем ПЕРВЫМ, чтобы не съел /m/.
   const p2p = /^\/p2p\/([^/]+)\/?$/.exec(path);
   if (p2p) {
-    return { roomId: p2p[1]!, mode: 'p2p', password };
+    return { roomId: normalizeRoomId(p2p[1]!), mode: 'p2p', password };
   }
   // /m/<roomId> — auto-detect. Hash также пробрасываем (на случай если /api/mode
   // вернёт p2p — пароль уже будет под рукой).
   const m = /^\/m\/([^/]+)\/?$/.exec(path);
   if (m) {
-    return { roomId: m[1]!, mode: 'auto', password };
+    return { roomId: normalizeRoomId(m[1]!), mode: 'auto', password };
   }
   return null;
 }
