@@ -22,8 +22,8 @@ const baseGridStyle: CSSProperties = {
   height: '100%',
   gap: 8,
   padding: 8,
-  overflow: 'auto',
-  alignContent: 'start',
+  overflow: 'hidden',
+  boxSizing: 'border-box',
 };
 
 const emptyStyle: CSSProperties = {
@@ -70,12 +70,14 @@ function getEqualLayout(count: number): CSSProperties {
   };
 }
 
-// Tile для равной сетки занимает всю ячейку, поэтому нам нужен внешний
-// контейнер с aspectRatio 16:9 — чтобы тайлы не вытягивались.
+// Tile занимает всю ячейку грида целиком. Никакого aspectRatio тут — пусть
+// видео внутри (object-fit: contain) масштабируется под доступное место.
+// Это убирает скроллы при 1920×1080 камере на узком/коротком вьюпорте.
 const equalCellStyle: CSSProperties = {
   position: 'relative',
   width: '100%',
-  aspectRatio: '16 / 9',
+  height: '100%',
+  minWidth: 0,
   minHeight: 0,
 };
 

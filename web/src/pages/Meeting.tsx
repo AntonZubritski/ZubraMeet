@@ -70,11 +70,13 @@ const pageStyle: CSSProperties = {
   flexDirection: 'column',
   height: '100%',
   width: '100%',
+  overflow: 'hidden',
 };
 
 const headerStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
+  flexWrap: 'wrap',
   gap: 12,
   padding: '10px 16px',
   borderBottom: '1px solid var(--border)',
@@ -176,7 +178,9 @@ const insecureBadgeStyle: CSSProperties = {
 const gridContainerStyle: CSSProperties = {
   flex: 1,
   minHeight: 0,
+  minWidth: 0,
   position: 'relative',
+  overflow: 'hidden',
   paddingBottom: 88, // место под фиксированный Controls
 };
 
