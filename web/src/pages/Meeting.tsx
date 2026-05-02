@@ -157,13 +157,6 @@ const relayStopBtnStyle: CSSProperties = {
   fontSize: 10,
 };
 
-const resBadgeStyle: CSSProperties = {
-  fontSize: 11,
-  color: 'var(--muted)',
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  cursor: 'help',
-};
-
 const modeBadgeStyle: CSSProperties = {
   fontSize: 11,
   padding: '2px 8px',
@@ -393,17 +386,6 @@ function formatRelayCost(ms: number): string {
   const hours = ms / 3_600_000;
   const cost = hours * HOUR_PRICE_EUR;
   return `€${cost.toFixed(4)}`;
-}
-
-function getVideoSize(stream: MediaStream | null): { w: number; h: number } | null {
-  if (!stream) return null;
-  const v = stream.getVideoTracks()[0];
-  if (!v) return null;
-  const settings = v.getSettings();
-  const w = typeof settings.width === 'number' ? settings.width : 0;
-  const h = typeof settings.height === 'number' ? settings.height : 0;
-  if (w === 0 || h === 0) return null;
-  return { w, h };
 }
 
 /**
@@ -1683,12 +1665,6 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
     });
   }
 
-  const size = getVideoSize(localStream);
-  const resTitle = size
-    ? `Локальное видео: ${size.w}×${size.h}`
-    : 'Локальное видео: только аудио';
-  const resBadge = size ? `${size.w}×${size.h}` : 'audio-only';
-
   // Подготовка строк для share-panel (только если SFU + endpoints получены).
   const showSharePanel = resolvedMode === 'sfu' && endpoints !== null;
   const hasIPv6 =
@@ -1727,9 +1703,6 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           )
         )}
         {resolvedMode === 'sfu' && <ConnectionBadge stats={stats} />}
-        <span style={resBadgeStyle} title={resTitle}>
-          {resBadge}
-        </span>
         {relay && (() => {
           // Парсим createdAt → Date. Если невалидный — fallback на 0 длительность.
           const createdMs = (() => {
