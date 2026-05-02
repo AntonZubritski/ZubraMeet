@@ -439,6 +439,12 @@ export class P2PMeetConnection {
     const preset = getScreenQualityPreset(quality);
     this.screenPreset = preset;
 
+    // getDisplayMedia не поддерживается в большинстве мобильных браузеров
+    // (iOS Safari, Android Chrome). Ловим до вызова чтобы дать осмысленную ошибку.
+    if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
+      throw new Error('Демонстрация экрана не поддерживается в этом браузере (мобильные iOS/Android не дают доступ к screen capture).');
+    }
+
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         width: { ideal: preset.width },

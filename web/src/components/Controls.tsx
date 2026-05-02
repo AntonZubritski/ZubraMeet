@@ -31,6 +31,15 @@ interface Props {
   hidden?: boolean;
 }
 
+// getDisplayMedia не поддерживается в большинстве мобильных браузеров
+// (iOS Safari, Android Chrome не дают screen capture API). Если его нет —
+// прячем кнопку screen-share, чтобы юзер не видел loud error.
+function isScreenShareSupported(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const md = navigator.mediaDevices as MediaDevices | undefined;
+  return !!md && typeof md.getDisplayMedia === 'function';
+}
+
 const ICON_SIZE = 20;
 
 const barStyle: CSSProperties = {
@@ -590,12 +599,14 @@ export default function Controls({
         <CamIcon off={!camOn} />
       </CircleButton>
 
-      <ScreenShareControl
-        active={screenSharing}
-        quality={screenQuality}
-        onToggle={onToggleScreenShare}
-        onChangeQuality={onChangeScreenQuality}
-      />
+      {isScreenShareSupported() && (
+        <ScreenShareControl
+          active={screenSharing}
+          quality={screenQuality}
+          onToggle={onToggleScreenShare}
+          onChangeQuality={onChangeScreenQuality}
+        />
+      )}
 
       <CircleButton
         variant="default"

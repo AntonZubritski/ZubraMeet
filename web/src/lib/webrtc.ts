@@ -220,6 +220,12 @@ export class MeetConnection {
 
     const preset = getScreenQualityPreset(quality);
 
+    // Mobile browsers (iOS Safari, Android Chrome) не имеют getDisplayMedia.
+    // Ловим до вызова чтобы дать понятную ошибку.
+    if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
+      throw new Error('Демонстрация экрана не поддерживается в этом браузере (мобильные iOS/Android не дают доступ к screen capture).');
+    }
+
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         width: { ideal: preset.width },
