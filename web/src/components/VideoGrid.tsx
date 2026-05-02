@@ -45,10 +45,41 @@ const THUMB_W = 180;
 const THUMB_H = 100;
 
 // Равная сетка для «обычного» режима (без screen-share).
-function getEqualLayout(count: number): CSSProperties {
+//
+// portrait — viewport выше чем шире (телефоны вертикально). На таком экране
+// тайлы лучше располагать столбиком, чтобы каждый занял всю ширину и был
+// высоким, а не узкой полоской.
+//
+// landscape — широкий экран (десктоп, телефон горизонтально). Тайлы в
+// классической сетке cols×rows.
+function getEqualLayout(count: number, portrait: boolean): CSSProperties {
   if (count <= 1) {
     return { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' };
   }
+  if (portrait) {
+    // На вертикальном экране всегда 1 колонка (или 2 для большой комнаты),
+    // тайлы вытягиваются по высоте.
+    if (count === 2) {
+      return { gridTemplateColumns: '1fr', gridTemplateRows: 'repeat(2, 1fr)' };
+    }
+    if (count === 3) {
+      return { gridTemplateColumns: '1fr', gridTemplateRows: 'repeat(3, 1fr)' };
+    }
+    if (count <= 6) {
+      // 4-6 → 2 колонки, нужное число рядов (ceil(count/2)).
+      const rows = Math.ceil(count / 2);
+      return {
+        gridTemplateColumns: 'repeat(2, 1fr)',
+        gridTemplateRows: `repeat(${rows}, 1fr)`,
+      };
+    }
+    // 7+ → auto-fit с минимальной шириной (всё равно сумма уйдёт в скролл если очень много, но overflow:hidden у баз).
+    return {
+      gridTemplateColumns: 'repeat(2, 1fr)',
+      gridAutoRows: '1fr',
+    };
+  }
+  // landscape (текущая логика).
   if (count === 2) {
     return { gridTemplateColumns: 'repeat(2, 1fr)', gridTemplateRows: '1fr' };
   }
@@ -81,22 +112,26 @@ const equalCellStyle: CSSProperties = {
   minHeight: 0,
 };
 
-// useViewportNarrow — следит за window.innerWidth.
-function useViewportNarrow(): boolean {
-  const [narrow, setNarrow] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false;
-    return window.innerWidth < NARROW_BREAKPOINT_PX;
-  });
-  useEffect(() => {
-    const onResize = (): void => {
-      setNarrow(window.innerWidth < NARROW_BREAKPOINT_PX);
+// useViewport — следит за window.innerWidth/Height и orientation.
+function useViewport(): { narrow: boolean; portrait: boolean } {
+  const compute = (): { narrow: boolean; portrait: boolean } => {
+    if (typeof window === 'undefined') return { narrow: false, portrait: false };
+    return {
+      narrow: window.innerWidth < NARROW_BREAKPOINT_PX,
+      portrait: window.innerHeight > window.innerWidth,
     };
+  };
+  const [vp, setVp] = useState(compute);
+  useEffect(() => {
+    const onResize = (): void => setVp(compute());
     window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
     return () => {
       window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
     };
   }, []);
-  return narrow;
+  return vp;
 }
 
 interface TileProps {
@@ -119,7 +154,7 @@ function Tile({ tile }: TileProps) {
 }
 
 export default function VideoGrid({ tiles }: Props) {
-  const narrow = useViewportNarrow();
+  const { narrow, portrait } = useViewport();
 
   if (tiles.length === 0) {
     return <div style={emptyStyle}>Нет участников</div>;
@@ -130,7 +165,7 @@ export default function VideoGrid({ tiles }: Props) {
 
   // === Обычный режим: равная сетка ===
   if (screenTiles.length === 0) {
-    const style: CSSProperties = { ...baseGridStyle, ...getEqualLayout(tiles.length) };
+    const style: CSSProperties = { ...baseGridStyle, ...getEqualLayout(tiles.length, portrait) };
     return (
       <div style={style}>
         {tiles.map((t) => (
