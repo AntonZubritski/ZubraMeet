@@ -632,8 +632,8 @@ function SmileButton({ onPickEmoji, onPickGif, customerId }: SmileButtonProps) {
 
   const handlePickEmoji = (emoji: string): void => {
     onPickEmoji(emoji);
-    // Emoji — закрываем picker сразу (одного клика обычно достаточно).
-    setOpen(false);
+    // Picker НЕ закрываем — юзер может слать несколько реакций подряд.
+    // Закрытие — через Escape, клик-вне или повторный клик по smile-кнопке.
   };
 
   const handlePickGif = (url: string, width: number, height: number): void => {

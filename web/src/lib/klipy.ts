@@ -91,15 +91,29 @@ function firstHttpsUrl(candidates: unknown[]): string {
 function extractGifUrl(
   item: unknown,
 ): { preview: string; full: string; width: number; height: number } | null {
-  // Klipy: item.file.gif.{xs,sm,sd,md,hd}.{url,width,height}
+  // Klipy РЕАЛЬНЫЙ shape (проверено через WebFetch trending):
+  //   item.file.{hd,md,sm,xs}.gif.{url, width, height, size}
+  // (gif вложен В quality-tier, а не наоборот). Также рядом
+  // .webp .jpg .mp4 .webm в каждом tier'е.
   const file = pick(item, 'file');
-  const gif = pick(file, 'gif');
-  const xs = pick(gif, 'xs');
-  const sm = pick(gif, 'sm');
-  const sd = pick(gif, 'sd');
-  const md = pick(gif, 'md');
-  const hd = pick(gif, 'hd');
-  const previewKlipy = pick(gif, 'preview');
+  const fileXsTier = pick(file, 'xs');
+  const fileSmTier = pick(file, 'sm');
+  const fileMdTier = pick(file, 'md');
+  const fileHdTier = pick(file, 'hd');
+  const xs = pick(fileXsTier, 'gif');
+  const sm = pick(fileSmTier, 'gif');
+  const md = pick(fileMdTier, 'gif');
+  const hd = pick(fileHdTier, 'gif');
+  // На случай если бывает старый/альтернативный shape file.gif.<tier>:
+  const altGif = pick(file, 'gif');
+  const altXs = pick(altGif, 'xs');
+  const altSm = pick(altGif, 'sm');
+  const altSd = pick(altGif, 'sd');
+  const altMd = pick(altGif, 'md');
+  const altHd = pick(altGif, 'hd');
+  const previewKlipy = pick(altGif, 'preview');
+  // blur_preview — статический thumbnail, иногда есть на верхнем уровне.
+  const blurPreview = pick(item, 'blur_preview');
 
   // Tenor v2: item.media_formats.{tinygif,nanogif,gif,mediumgif}
   const mf = pick(item, 'media_formats');
@@ -123,11 +137,16 @@ function extractGifUrl(
   const imgOrig = pick(images, 'original');
 
   const previewCandidates: unknown[] = [
+    // Real Klipy: file.xs.gif.url / file.sm.gif.url
     pick(xs, 'url'),
     pick(sm, 'url'),
+    // Alt Klipy shape (old)
+    pick(altXs, 'url'),
+    pick(altSm, 'url'),
     pick(previewKlipy, 'url'),
     typeof previewKlipy === 'string' ? previewKlipy : undefined,
     typeof pick(item, 'preview') === 'string' ? pick(item, 'preview') : undefined,
+    typeof blurPreview === 'string' ? blurPreview : undefined,
     pick(tfTiny, 'url'),
     pick(tfNano, 'url'),
     pick(m0Tiny, 'url'),
@@ -136,15 +155,22 @@ function extractGifUrl(
     pick(imgPrevGif, 'url'),
   ];
   const fullCandidates: unknown[] = [
-    pick(sd, 'url'),
+    // Real Klipy: file.sm/md/hd.gif.url — sm для веса, md если sm нет.
+    pick(sm, 'url'),
     pick(md, 'url'),
     pick(hd, 'url'),
+    pick(xs, 'url'),
+    // Alt
+    pick(altSd, 'url'),
+    pick(altMd, 'url'),
+    pick(altHd, 'url'),
+    pick(altSm, 'url'),
+    pick(altXs, 'url'),
     pick(tfGif, 'url'),
     pick(tfMed, 'url'),
     pick(m0Gif, 'url'),
     pick(imgFix, 'url'),
     pick(imgOrig, 'url'),
-    pick(xs, 'url'),
   ];
 
   // Tenor dims: media_formats.gif.dims = [w, h]
@@ -156,10 +182,15 @@ function extractGifUrl(
   const m0DimsH = Array.isArray(m0GifDims) ? m0GifDims[1] : undefined;
 
   const widthCandidates: unknown[] = [
-    pick(sd, 'width'),
+    pick(sm, 'width'),
     pick(md, 'width'),
     pick(hd, 'width'),
     pick(xs, 'width'),
+    pick(altSd, 'width'),
+    pick(altMd, 'width'),
+    pick(altHd, 'width'),
+    pick(altSm, 'width'),
+    pick(altXs, 'width'),
     tfDimsW,
     pick(tfGif, 'width'),
     m0DimsW,
@@ -167,10 +198,15 @@ function extractGifUrl(
     pick(imgOrig, 'width'),
   ];
   const heightCandidates: unknown[] = [
-    pick(sd, 'height'),
+    pick(sm, 'height'),
     pick(md, 'height'),
     pick(hd, 'height'),
     pick(xs, 'height'),
+    pick(altSd, 'height'),
+    pick(altMd, 'height'),
+    pick(altHd, 'height'),
+    pick(altSm, 'height'),
+    pick(altXs, 'height'),
     tfDimsH,
     pick(tfGif, 'height'),
     m0DimsH,
