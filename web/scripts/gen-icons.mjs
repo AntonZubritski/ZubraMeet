@@ -1,17 +1,21 @@
-// Берёт ИСХОДНУЮ иконку из scripts/favicon-source.svg, прогоняет через sharp с
-// hue-rotate (зелёный -> жёлто-зелёный), и пишет:
-//   public/favicon.svg              - SVG-обёртка с тем же исходным растром
-//                                     внутри + SVG-фильтром recolor
-//   public/favicon-96x96.png
-//   public/favicon.ico              - копия 96px PNG (fallback)
-//   public/apple-touch-icon.png     - 180px
-//   public/web-app-manifest-192x192.png
-//   public/web-app-manifest-512x512.png
+// Берёт исходную иконку из scripts/favicon-source.svg и генерит adaptive
+// набор:
+//   public/favicon.svg              - SVG с встроенным @media prefers-color-scheme:
+//                                     тёмная иконка на светлом фоне ОС, белая
+//                                     иконка на тёмном фоне ОС.
+//   public/favicon-light.png        - чёрный силуэт (для светлой темы ОС)
+//   public/favicon-dark.png         - белый силуэт (для тёмной темы ОС)
+//   public/favicon.ico              - копия light PNG (fallback)
+//   public/apple-touch-icon.png     - 180px белый (iOS обычно использует на тёмной home-screen)
+//   public/web-app-manifest-192x192.png  - белый (PWA на тёмном theme-color #0a0a0a)
+//   public/web-app-manifest-512x512.png  - белый
 //
-// HUE_DEG/SAT_MULT/LIGHT_MULT — параметры тонировки. Подкручивай чтобы
-// добиться нужного желто-зелёного оттенка.
+// index.html подключает favicon.svg + два PNG с media-query:
+//   <link rel="icon" type="image/svg+xml" href="favicon.svg">
+//   <link rel="icon" type="image/png" sizes="96x96" href="favicon-light.png" media="(prefers-color-scheme: light)">
+//   <link rel="icon" type="image/png" sizes="96x96" href="favicon-dark.png" media="(prefers-color-scheme: dark)">
 //
-// Запускать после правки исходника:
+// Запускать после правки favicon-source.svg:
 //   node scripts/gen-icons.mjs
 
 import sharp from 'sharp';
@@ -23,60 +27,93 @@ const here = dirname(fileURLToPath(import.meta.url));
 const publicDir = join(here, '..', 'public');
 const sourceSvgPath = join(here, 'favicon-source.svg');
 
-// Тонировка под фирменные цвета ZubraMeet (#22c55e зелёный, #fbbf24 жёлтый).
-// hue 60° сдвигает зелёный в жёлто-зелёный; saturation чуть выше для
-// насыщенности; lightness 1 = без изменений яркости.
-const HUE_DEG = 60;
-const SAT_MULT = 1.4;
-const LIGHT_MULT = 1.0;
-
 const sourceSvg = await readFile(sourceSvgPath);
 
-// Sharp читает SVG, рендерит в высоком разрешении (512), потом modulate
-// меняет HSL. Дальше уже resize в нужный размер для каждого таргета.
-async function recolored(size) {
-  return sharp(sourceSvg, { density: 600 })
+// Превращаем растровое изображение из source в монохромный силуэт нужного
+// цвета. Через feColorMatrix: RGB заменяем на константу r/g/b, A берём из
+// исходника. Sharp умеет применять linear (для grayscale->color),
+// но проще через recolor pipeline: extract alpha, multiply by tint.
+//
+// monochrome = 1 (белый) или 0 (чёрный) или конкретный цвет.
+async function monochrome(size, color) {
+  // Рендерим SVG в raster нужного размера.
+  const png = await sharp(sourceSvg, { density: 600 })
     .resize(size, size, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-    .modulate({ hue: HUE_DEG, saturation: SAT_MULT, lightness: LIGHT_MULT })
+    .png()
+    .toBuffer();
+
+  // Извлекаем alpha-канал (форма иконки).
+  const alpha = await sharp(png).extractChannel('alpha').toBuffer();
+  const meta = await sharp(png).metadata();
+
+  // Создаём solid-цветный прямоугольник нужного размера + alpha из иконки.
+  return sharp({
+    create: {
+      width: meta.width,
+      height: meta.height,
+      channels: 4,
+      background: { r: color.r, g: color.g, b: color.b, alpha: 1 },
+    },
+  })
+    .joinChannel(alpha)
     .png()
     .toBuffer();
 }
 
-const targets = [
-  { name: 'favicon-96x96.png', size: 96 },
-  { name: 'apple-touch-icon.png', size: 180 },
-  { name: 'web-app-manifest-192x192.png', size: 192 },
-  { name: 'web-app-manifest-512x512.png', size: 512 },
-];
+const BLACK = { r: 0, g: 0, b: 0 };
+const WHITE = { r: 255, g: 255, b: 255 };
 
-for (const t of targets) {
-  const png = await recolored(t.size);
-  await writeFile(join(publicDir, t.name), png);
-  console.log(`OK ${t.name} (${png.length} bytes)`);
+// Раздельные light/dark PNG-наборы.
+const lightPng96 = await monochrome(96, BLACK);
+await writeFile(join(publicDir, 'favicon-light.png'), lightPng96);
+console.log('OK favicon-light.png');
+
+const darkPng96 = await monochrome(96, WHITE);
+await writeFile(join(publicDir, 'favicon-dark.png'), darkPng96);
+console.log('OK favicon-dark.png');
+
+// favicon.ico — fallback. Берём light (чёрная иконка) — большинство юзеров
+// в ОС светлая тема + .ico всё равно перетирается современным svg на
+// браузерах поддерживающих SVG.
+await writeFile(join(publicDir, 'favicon.ico'), lightPng96);
+console.log('OK favicon.ico (light fallback)');
+
+// apple-touch-icon: iOS показывает на home-screen, обычно с цветным фоном
+// (theme_color из manifest = #0a0a0a). Используем БЕЛУЮ иконку.
+const apple = await monochrome(180, WHITE);
+await writeFile(join(publicDir, 'apple-touch-icon.png'), apple);
+console.log('OK apple-touch-icon.png');
+
+// web-app-manifest: PWA на dark background. БЕЛАЯ иконка.
+for (const size of [192, 512]) {
+  const png = await monochrome(size, WHITE);
+  await writeFile(join(publicDir, `web-app-manifest-${size}x${size}.png`), png);
+  console.log(`OK web-app-manifest-${size}x${size}.png`);
 }
 
-// favicon.ico — большинство браузеров принимают PNG-with-.ico-extension
-// (формально это не multi-resolution ICO, но fallback работает).
-await writeFile(join(publicDir, 'favicon.ico'), await recolored(96));
-console.log('OK favicon.ico (PNG-as-ICO fallback)');
+// favicon.svg — adaptive через @media prefers-color-scheme.
+// Берём исходный raster через extract base64 PNG чтобы можно было
+// раскрасить через CSS-fill (но raster не имеет fill-атрибута, поэтому
+// используем mask: flood-цвет с alpha-маской из иконки).
+const inner = sourceSvg.toString();
+const m = inner.match(/(data:image\/png;base64,[A-Za-z0-9+/=]+)/);
+if (!m) {
+  throw new Error('Не нашёл base64 PNG в favicon-source.svg');
+}
+const dataUri = m[1];
 
-// Для favicon.svg обёртка с filter, чтобы современные браузеры тоже видели
-// ту же тонировку без перерасчёта rasterа. feColorMatrix с hueRotate.
-const wrapperSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 483 483">
+const adaptiveSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 483 483">
   <defs>
-    <filter id="zubrameet-recolor" x="0" y="0" width="100%" height="100%">
-      <feColorMatrix type="hueRotate" values="${HUE_DEG}"/>
-      <feColorMatrix type="matrix" values="
-        ${SAT_MULT} 0 0 0 0
-        0 ${SAT_MULT} 0 0 0
-        0 0 ${SAT_MULT} 0 0
-        0 0 0 1 0"/>
-    </filter>
+    <mask id="silhouette" maskContentUnits="userSpaceOnUse" maskUnits="userSpaceOnUse">
+      <image x="0" y="0" width="483" height="483" href="${dataUri}"/>
+    </mask>
   </defs>
-  <g filter="url(#zubrameet-recolor)">
-    ${sourceSvg.toString().replace(/^[\s\S]*?<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '')}
-  </g>
+  <style>
+    .icon { fill: #0a0a0a; }
+    @media (prefers-color-scheme: dark) { .icon { fill: #ffffff; } }
+  </style>
+  <rect class="icon" width="483" height="483" mask="url(#silhouette)"/>
 </svg>
 `;
-await writeFile(join(publicDir, 'favicon.svg'), wrapperSvg);
-console.log('OK favicon.svg (recolor wrapper)');
+await writeFile(join(publicDir, 'favicon.svg'), adaptiveSvg);
+console.log('OK favicon.svg (adaptive)');
