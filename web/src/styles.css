@@ -215,3 +215,38 @@ input:focus, select:focus, textarea:focus {
   80%  { opacity: 0; }
   100% { transform: scale(2.4); opacity: 0; }
 }
+
+/* CSS-tooltip через data-tip. Появляется мгновенно (без 2-сек задержки
+   нативного title=), не блокирует layout (position: absolute), не зависит
+   от ОС/браузера. Любой элемент с data-tip="..." получит подсказку при hover. */
+[data-tip] {
+  position: relative;
+}
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%) translateY(-4px);
+  background: rgba(20, 20, 20, 0.96);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+  width: max-content;
+  max-width: 280px;
+  text-align: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease;
+  z-index: 1000;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+[data-tip]:hover::after,
+[data-tip]:focus-visible::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}

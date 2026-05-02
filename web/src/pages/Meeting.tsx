@@ -164,7 +164,6 @@ const modeBadgeStyle: CSSProperties = {
   border: '1px solid var(--border)',
   background: 'var(--bg)',
   color: 'var(--muted)',
-  cursor: 'help',
   whiteSpace: 'nowrap',
 };
 
@@ -175,7 +174,6 @@ const secureBadgeStyle: CSSProperties = {
   border: '1px solid rgba(34, 197, 94, 0.4)',
   background: 'rgba(34, 197, 94, 0.12)',
   color: 'var(--accent)',
-  cursor: 'help',
   whiteSpace: 'nowrap',
 };
 
@@ -186,7 +184,6 @@ const insecureBadgeStyle: CSSProperties = {
   border: '1px solid rgba(234, 179, 8, 0.4)',
   background: 'rgba(234, 179, 8, 0.12)',
   color: '#eab308',
-  cursor: 'help',
   whiteSpace: 'nowrap',
 };
 
@@ -1524,9 +1521,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
     // Лейбл режима для бейджика. Если auto и пока null — "Определяю…".
     const preJoinModeLabel: string =
       resolvedMode === 'p2p'
-        ? '🌐 P2P-режим'
+        ? '🌐 Через интернет'
         : resolvedMode === 'sfu'
-        ? '📡 SFU-режим'
+        ? '📡 Через хост'
         : 'Определяю режим подключения…';
 
     const preJoinPageStyle: CSSProperties = {
@@ -1727,11 +1724,12 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   const hasIPv6 =
     diagnosis !== null && diagnosis.publicIPv6.length > 0;
 
-  const modeBadgeLabel = resolvedMode === 'p2p' ? '🌐 P2P-режим' : '📡 SFU-режим';
+  const modeBadgeLabel =
+    resolvedMode === 'p2p' ? '🌐 Через интернет' : '📡 Через хост';
   const modeBadgeTitle =
     resolvedMode === 'p2p'
-      ? 'P2P: видео идёт напрямую между всеми (mesh через Nostr-сигналинг). Хорошо для маленьких комнат и хостов за CGNAT. Если за symmetric NAT — fallback через бесплатный публичный TURN (OpenRelay).'
-      : 'SFU: видео идёт через хоста-сервер. Лучше масштабируется на много участников.';
+      ? 'Видео идёт напрямую между участниками (peer-to-peer). Сигналинг — через распределённую Nostr-сеть. Без серверов посередине.'
+      : 'Видео идёт через создателя мита (он работает локальным сервером для всех гостей).';
 
   // Динамические стили для auto-hide:
   // - header едет вверх (translateY(-100%)), opacity 0, pointer-events: none.
@@ -1765,21 +1763,21 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         <h1 style={titleStyle}>
           Мит <span style={roomIdStyle}>{roomId}</span>
         </h1>
-        <span style={modeBadgeStyle} title={modeBadgeTitle}>
+        <span style={modeBadgeStyle} data-tip={modeBadgeTitle}>
           {modeBadgeLabel}
         </span>
         {resolvedMode === 'p2p' && (
           password ? (
             <span
               style={secureBadgeStyle}
-              title="Зашифровано (E2EE): сигналинг и data-channel шифруются pre-shared password из ссылки. Без правильной ссылки подключиться нельзя."
+              data-tip="Зашифровано: видео, аудио и сигналинг защищены паролем из ссылки. Без полной ссылки подключиться нельзя."
             >
-              🔒 E2EE
+              🔒 Зашифровано
             </span>
           ) : (
             <span
               style={insecureBadgeStyle}
-              title="Без шифрования: кто угодно с этим roomId может зайти. Создайте новый мит, чтобы получить защищённую ссылку."
+              data-tip="Кто угодно с этим ID может зайти. Создайте новый мит, чтобы получить защищённую ссылку с паролем."
             >
               ⚠ Без шифрования
             </span>
