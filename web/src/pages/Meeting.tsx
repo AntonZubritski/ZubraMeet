@@ -19,6 +19,10 @@ import { navigate } from '../App';
 import { SignalClient, buildWsUrl } from '../lib/signal';
 import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
 import { P2PMeetConnection, type P2PMeetEvents } from '../lib/p2p';
+import {
+  DEFAULT_SCREEN_QUALITY,
+  type ScreenQuality,
+} from '../lib/screen-quality';
 import type {
   ConnectionStats,
   ConnectivityResp,
@@ -418,6 +422,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [screenSharing, setScreenSharing] = useState<boolean>(false);
+  // Выбранное пользователем качество демонстрации экрана. Применяется при
+  // следующем startScreenShare. Меняется через dropdown в Controls. Во время
+  // активной трансляции не меняется (preset фиксируется на старте).
+  const [screenQuality, setScreenQuality] = useState<ScreenQuality>(DEFAULT_SCREEN_QUALITY);
   const [peers, setPeers] = useState<Map<string, PeerEntry>>(() => new Map());
   // Удалённые screen-share стримы (только в P2P-режиме — в SFU всё прилетает
   // через onRemoteTrack как обычный track одного stream'а).
@@ -1187,8 +1195,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
     // SFU и P2P API совместимы по сигнатуре start/stopScreenShare.
     const sfu = sfuConnectionRef.current;
     const p2p = p2pConnectionRef.current;
-    const conn: { startScreenShare(): Promise<MediaStream>; stopScreenShare(): Promise<void> } | null =
-      sfu ?? p2p ?? null;
+    const conn: {
+      startScreenShare(quality?: ScreenQuality): Promise<MediaStream>;
+      stopScreenShare(): Promise<void>;
+    } | null = sfu ?? p2p ?? null;
     if (!conn) return;
     if (screenSharing) {
       void conn
@@ -1204,7 +1214,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         });
     } else {
       void conn
-        .startScreenShare()
+        .startScreenShare(screenQuality)
         .then((s) => {
           setScreenStream(s);
           setScreenSharing(true);
@@ -1790,9 +1800,11 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         micOn={micOn}
         camOn={camOn}
         screenSharing={screenSharing}
+        screenQuality={screenQuality}
         onToggleMic={handleToggleMic}
         onToggleCam={handleToggleCam}
         onToggleScreenShare={handleToggleScreenShare}
+        onChangeScreenQuality={setScreenQuality}
         onLeave={handleLeave}
         onCopyInvite={handleCopyInvite}
       />

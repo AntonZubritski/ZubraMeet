@@ -16,6 +16,12 @@
 
 import { joinRoom, type Room, type ActionSender } from 'trystero';
 import { PUBLIC_ICE_SERVERS } from './ice';
+import {
+  DEFAULT_SCREEN_QUALITY,
+  getScreenQualityPreset,
+  type ScreenQuality,
+  type ScreenQualityPreset,
+} from './screen-quality';
 
 export type RemoteStreamKind = 'camera' | 'screen';
 
@@ -99,6 +105,9 @@ export class P2PMeetConnection {
   private cameraStream: MediaStream | null = null;
   // Локальный screen-share стрим, если активен.
   private screenStream: MediaStream | null = null;
+  // Текущий screen-quality preset. Нужен tuneVideoEncoding(): если у sender'а
+  // contentHint==='detail' — это screen и применяем maxBitrate из этого preset.
+  private screenPreset: ScreenQualityPreset | null = null;
 
   private closed = false;
   // Чтобы start() нельзя было вызвать дважды.
@@ -206,6 +215,18 @@ export class P2PMeetConnection {
       // Сохраняем локальный stream — onPeerJoin будет пушить его новым
       // peer'ам. Trystero v0.24 НЕ реплеит ранее добавленные стримы автоматом.
       this.cameraStream = localStream;
+
+      // contentHint='motion' для камеры: подсказка encoder'у что важнее
+      // плавность движения, чем резкость деталей (типичная говорящая голова).
+      // Применяется ДО addStream, чтобы encoder заинициализировался уже с этой
+      // подсказкой. Безопасно для аудио-треков (контент-хинт там игнорируется).
+      for (const track of localStream.getVideoTracks()) {
+        try {
+          track.contentHint = 'motion';
+        } catch {
+          /* ignore — старый браузер без contentHint */
+        }
+      }
 
       // Initial publish — для уже-подключённых peer'ов (если room не пуст).
       try {
@@ -330,12 +351,20 @@ export class P2PMeetConnection {
   // ─── screen sharing ────────────────────────────────────────────────────────
 
   /**
-   * Запускает screen-share: берёт displayMedia, публикует в room с metadata='screen',
-   * вешает onended на video-track (на случай "Stop sharing" из браузерного UI).
+   * Запускает screen-share: берёт displayMedia с constraints из preset,
+   * публикует в room с metadata='screen', вешает onended на video-track
+   * (на случай "Stop sharing" из браузерного UI).
+   *
+   * @param quality preset качества (default 'hd'). Влияет на ideal-разрешение
+   *   и frameRate в getDisplayMedia + maxBitrate в setParameters.
+   *
    * Возвращает полученный MediaStream — caller может использовать для локального preview.
-   * Идемпотентен: повторный вызов при активном screen-share вернёт уже полученный стрим.
+   * Идемпотентен: повторный вызов при активном screen-share вернёт уже полученный стрим
+   * (без переключения качества — для смены качества нужно сначала stopScreenShare).
    */
-  async startScreenShare(): Promise<MediaStream> {
+  async startScreenShare(
+    quality: ScreenQuality = DEFAULT_SCREEN_QUALITY,
+  ): Promise<MediaStream> {
     if (this.screenStream) {
       return this.screenStream;
     }
@@ -344,13 +373,33 @@ export class P2PMeetConnection {
       throw new Error('startScreenShare: room not ready');
     }
 
+    const preset = getScreenQualityPreset(quality);
+    this.screenPreset = preset;
+
     const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30 } },
+      video: {
+        width: { ideal: preset.width },
+        height: { ideal: preset.height },
+        frameRate: { ideal: preset.frameRate },
+      },
       audio: false,
     });
 
     // Запоминаем до addStream, чтобы onended-handler знал что мы это запустили.
     this.screenStream = stream;
+
+    // contentHint='detail' для screen: encoder приоритезирует резкость
+    // деталей (текст, UI) над плавностью движения. Также служит маркером
+    // в tuneVideoEncoding() — по нему различаем screen-sender'ы от
+    // camera-sender'ов и применяем разные degradationPreference/maxBitrate.
+    // Применяется ДО addStream — encoder заинициализируется уже с подсказкой.
+    for (const track of stream.getVideoTracks()) {
+      try {
+        track.contentHint = 'detail';
+      } catch {
+        /* ignore — старый браузер без contentHint */
+      }
+    }
 
     // "Stop sharing" из браузерного UI кончает video-track → стопим всё.
     for (const track of stream.getTracks()) {
@@ -373,6 +422,20 @@ export class P2PMeetConnection {
       this.reportError(err, 'addStream(screen)');
     }
 
+    // Прокатываем encoding-параметры по всем уже трекаемым PC. tuneVideoEncoding
+    // теперь различает camera vs screen по contentHint и применяет соответствующие
+    // настройки. Для свежесозданных PC (новые peer'ы после старта share)
+    // tuneVideoEncoding отрабатывает в trackPeerPC().
+    //
+    // Sender для screen-track появляется в pc.getSenders() асинхронно после
+    // addStream — поэтому ретраим несколько раз с интервалом, пока screen-sender
+    // не материализуется (либо не сдадимся через 5 попыток).
+    for (const pc of this.trackedPCs.values()) {
+      void this.tuneScreenEncodingWithRetry(pc).catch((err: unknown) => {
+        this.reportError(err, 'tuneScreenEncoding(screen-start)');
+      });
+    }
+
     try {
       this.events.onScreenShareStarted?.(stream);
     } catch (err) {
@@ -392,6 +455,7 @@ export class P2PMeetConnection {
     if (!stream) return;
     // Сразу обнуляем чтобы onended не зашёл рекурсивно.
     this.screenStream = null;
+    this.screenPreset = null;
 
     const room = this.room;
     if (room) {
@@ -471,6 +535,7 @@ export class P2PMeetConnection {
       }
       this.screenStream = null;
     }
+    this.screenPreset = null;
 
     const room = this.room;
     this.room = null;
@@ -542,12 +607,22 @@ export class P2PMeetConnection {
     });
   }
 
-  // Настраивает encoding-параметры для всех sendonly video-треков этого PC:
-  //  - снимает дефолтный maxBitrate (≈500 kbps)
-  //  - degradationPreference 'balanced' — при перегрузке сети браузер
-  //    балансированно роняет и framerate, и resolution (вместо того чтобы
-  //    держать разрешение и фризить)
-  //  - networkPriority 'high' — приоритет видео-пакетов над data-channel
+  // Настраивает encoding-параметры для всех sendonly video-треков этого PC.
+  // Различает два типа video-sender'ов по track.contentHint:
+  //
+  //  CAMERA (contentHint !== 'detail'/'text'):
+  //   - снимает дефолтный maxBitrate (≈500 kbps) — пусть adaptive BWE решает
+  //   - degradationPreference 'balanced' — при перегрузке сети роняем и fps,
+  //     и resolution; для говорящей головы оба деграда приемлемы
+  //   - networkPriority 'high'
+  //
+  //  SCREEN (contentHint === 'detail' или 'text'):
+  //   - maxBitrate из текущего preset (this.screenPreset.maxBitrate)
+  //   - degradationPreference 'maintain-resolution' — при просадке канала
+  //     роняем fps, но НЕ разрешение. Читабельный документ на 10 fps лучше
+  //     мутного на 30 fps
+  //   - networkPriority 'high'
+  //
   // Безопасно вызывать многократно (setParameters идемпотентен).
   // Ретраит до 5 раз с интервалом 500ms, потому что senders создаются
   // асинхронно после addStream.
@@ -559,34 +634,92 @@ export class P2PMeetConnection {
     for (const sender of pc.getSenders()) {
       if (!sender.track || sender.track.kind !== 'video') continue;
       videoSenders++;
+
+      const hint = sender.track.contentHint;
+      const isScreen = hint === 'detail' || hint === 'text';
+
       const params = sender.getParameters();
       if (!params.encodings || params.encodings.length === 0) {
         params.encodings = [{}];
       }
       let changed = false;
-      for (const e of params.encodings) {
-        // Снимаем cap — пусть adaptive bandwidth estimation решает.
-        if (e.maxBitrate !== undefined) {
-          delete e.maxBitrate;
+
+      if (isScreen) {
+        // Берём maxBitrate из активного screen-preset. Если screenPreset
+        // ещё не выставлен (race) — fallback на default.
+        const preset = this.screenPreset ?? getScreenQualityPreset(DEFAULT_SCREEN_QUALITY);
+        for (const e of params.encodings) {
+          if (e.maxBitrate !== preset.maxBitrate) {
+            e.maxBitrate = preset.maxBitrate;
+            changed = true;
+          }
+          if (e.networkPriority !== 'high') {
+            e.networkPriority = 'high';
+            changed = true;
+          }
+        }
+        if (params.degradationPreference !== 'maintain-resolution') {
+          params.degradationPreference = 'maintain-resolution';
           changed = true;
         }
-        if (e.networkPriority !== 'high') {
-          e.networkPriority = 'high';
+      } else {
+        // Camera-sender: убираем cap, balanced.
+        for (const e of params.encodings) {
+          if (e.maxBitrate !== undefined) {
+            delete e.maxBitrate;
+            changed = true;
+          }
+          if (e.networkPriority !== 'high') {
+            e.networkPriority = 'high';
+            changed = true;
+          }
+        }
+        if (params.degradationPreference !== 'balanced') {
+          params.degradationPreference = 'balanced';
           changed = true;
         }
       }
-      // degradationPreference — на уровне всего sender, не encoding.
-      if (params.degradationPreference !== 'balanced') {
-        params.degradationPreference = 'balanced';
-        changed = true;
-      }
+
       if (changed) {
-        await sender.setParameters(params);
+        try {
+          await sender.setParameters(params);
+        } catch (err) {
+          this.reportError(err, `setParameters(${isScreen ? 'screen' : 'camera'})`);
+        }
       }
     }
     if (videoSenders === 0 && attempt < 5 && !this.closed) {
       window.setTimeout(() => {
         void this.tuneVideoEncoding(pc, attempt + 1);
+      }, 500);
+    }
+  }
+
+  // После addStream(screen) screen-sender появляется в pc.getSenders()
+  // асинхронно (после renegotiation). Этот хелпер ретраит tuneVideoEncoding
+  // до тех пор, пока хотя бы один sender с contentHint='detail'/'text' не
+  // обнаружится — или пока не исчерпаем попытки (5 × 500ms = 2.5с).
+  private async tuneScreenEncodingWithRetry(
+    pc: RTCPeerConnection,
+    attempt = 0,
+  ): Promise<void> {
+    if (this.closed) return;
+    let foundScreen = false;
+    for (const sender of pc.getSenders()) {
+      if (!sender.track || sender.track.kind !== 'video') continue;
+      const hint = sender.track.contentHint;
+      if (hint === 'detail' || hint === 'text') {
+        foundScreen = true;
+        break;
+      }
+    }
+    // Tune в любом случае (camera-sender'ы тоже могут хотеть rebalance после
+    // того как screen появился рядом с ними — но фактически их параметры не
+    // зависят от наличия screen, поэтому это идемпотентно).
+    await this.tuneVideoEncoding(pc);
+    if (!foundScreen && attempt < 5 && !this.closed && this.screenStream) {
+      window.setTimeout(() => {
+        void this.tuneScreenEncodingWithRetry(pc, attempt + 1);
       }, 500);
     }
   }

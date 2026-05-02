@@ -1,12 +1,28 @@
-import { useState, type CSSProperties, type ReactNode } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from 'react';
+import {
+  SCREEN_QUALITY_PRESETS,
+  type ScreenQuality,
+} from '../lib/screen-quality';
 
 interface Props {
   micOn: boolean;
   camOn: boolean;
   screenSharing: boolean;
+  // Текущий выбранный preset качества screen-share. Используется только когда
+  // screenSharing === false — открыв dropdown, пользователь увидит активную опцию.
+  // Во время активной трансляции качество не меняется (нужно остановить и
+  // перезапустить).
+  screenQuality: ScreenQuality;
   onToggleMic(): void;
   onToggleCam(): void;
   onToggleScreenShare(): void;
+  onChangeScreenQuality(q: ScreenQuality): void;
   onLeave(): void;
   onCopyInvite(): void;
 }
@@ -209,6 +225,24 @@ function ScreenShareIcon({ active }: { active: boolean }) {
   );
 }
 
+function ChevronUpIcon() {
+  return (
+    <svg
+      width={12}
+      height={12}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="6 15 12 9 18 15" />
+    </svg>
+  );
+}
+
 function CopyIcon() {
   return (
     <svg
@@ -249,13 +283,239 @@ function PhoneDownIcon() {
   );
 }
 
+// Композитная кнопка screen-share: левая половина — основная кнопка
+// (старт/стоп трансляции), правая — стрелка-toggle dropdown'а с выбором
+// качества. Когда screen-share активен, dropdown скрыт (качество не меняется
+// на лету). Закрывается по клику вне.
+interface ScreenShareControlProps {
+  active: boolean;
+  quality: ScreenQuality;
+  onToggle(): void;
+  onChangeQuality(q: ScreenQuality): void;
+}
+
+function ScreenShareControl({
+  active,
+  quality,
+  onToggle,
+  onChangeQuality,
+}: ScreenShareControlProps) {
+  const [hovered, setHovered] = useState(false);
+  const [chevHovered, setChevHovered] = useState(false);
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // Закрытие по клику вне.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (ev: MouseEvent | TouchEvent): void => {
+      const root = containerRef.current;
+      if (!root) return;
+      const target = ev.target as Node | null;
+      if (target && root.contains(target)) return;
+      setOpen(false);
+    };
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('touchstart', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('touchstart', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  // Когда трансляция активна — закрываем dropdown (на всякий случай).
+  useEffect(() => {
+    if (active) setOpen(false);
+  }, [active]);
+
+  const variant: Variant = active ? 'active' : 'default';
+
+  // Пилюля из двух частей: main (круг 48×48) + chevron-tab (узкий справа).
+  // Объединяем в общий border-radius 999px без зазора.
+  const wrapperStyle: CSSProperties = {
+    position: 'relative',
+    display: 'inline-flex',
+    alignItems: 'center',
+  };
+
+  const mainBase: CSSProperties = {
+    width: 48,
+    height: 48,
+    borderTopLeftRadius: 999,
+    borderBottomLeftRadius: 999,
+    borderTopRightRadius: active ? 999 : 0,
+    borderBottomRightRadius: active ? 999 : 0,
+    border: '1px solid var(--border)',
+    borderRight: active ? '1px solid var(--border)' : 'none',
+    background: 'var(--panel)',
+    color: 'var(--fg)',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    padding: 0,
+    transition: 'background-color 120ms ease, border-color 120ms ease, color 120ms ease',
+  };
+
+  let mainStyle: CSSProperties = mainBase;
+  if (variant === 'active') {
+    mainStyle = {
+      ...mainBase,
+      background: 'var(--accent)',
+      borderColor: 'var(--accent)',
+      color: '#0a0a0a',
+    };
+  } else {
+    mainStyle = {
+      ...mainBase,
+      background: hovered ? '#1f1f1f' : 'var(--panel)',
+      borderColor: hovered ? '#333' : 'var(--border)',
+    };
+  }
+
+  const chevStyle: CSSProperties = {
+    width: 22,
+    height: 48,
+    borderTopRightRadius: 999,
+    borderBottomRightRadius: 999,
+    border: '1px solid var(--border)',
+    borderLeft: 'none',
+    background: chevHovered ? '#1f1f1f' : 'var(--panel)',
+    color: 'var(--fg)',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    padding: 0,
+    transition: 'background-color 120ms ease, border-color 120ms ease',
+  };
+
+  const dropdownStyle: CSSProperties = {
+    position: 'absolute',
+    bottom: 'calc(100% + 8px)',
+    right: 0,
+    minWidth: 200,
+    background: 'rgba(20, 20, 20, 0.97)',
+    backdropFilter: 'blur(8px)',
+    WebkitBackdropFilter: 'blur(8px)',
+    border: '1px solid var(--border)',
+    borderRadius: 10,
+    padding: 6,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+    zIndex: 110,
+    boxShadow: '0 8px 24px rgba(0, 0, 0, 0.4)',
+  };
+
+  const itemStyle = (selected: boolean): CSSProperties => ({
+    padding: '8px 10px',
+    borderRadius: 6,
+    fontSize: 13,
+    color: selected ? '#0a0a0a' : 'var(--fg)',
+    background: selected ? 'var(--accent)' : 'transparent',
+    border: 'none',
+    textAlign: 'left',
+    cursor: 'pointer',
+    fontWeight: selected ? 600 : 400,
+    transition: 'background-color 100ms ease',
+  });
+
+  const headerStyle: CSSProperties = {
+    fontSize: 11,
+    color: 'var(--muted)',
+    padding: '6px 10px 4px',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  };
+
+  const handleQualityClick = (q: ScreenQuality): void => {
+    onChangeQuality(q);
+    setOpen(false);
+    // Сразу запускаем демонстрацию выбранного качества — чтобы пользователю
+    // не пришлось делать второй клик. Если уже активна — ничего не делаем
+    // (dropdown в этом режиме всё равно скрыт useEffect выше).
+    if (!active) {
+      onToggle();
+    }
+  };
+
+  const ariaLabel = active ? 'Остановить трансляцию' : 'Транслировать экран';
+
+  return (
+    <div style={wrapperStyle} ref={containerRef}>
+      <button
+        type="button"
+        style={mainStyle}
+        onClick={onToggle}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onFocus={() => setHovered(true)}
+        onBlur={() => setHovered(false)}
+        aria-label={ariaLabel}
+        aria-pressed={active}
+        title={ariaLabel}
+      >
+        <ScreenShareIcon active={active} />
+      </button>
+
+      {!active && (
+        <button
+          type="button"
+          style={chevStyle}
+          onClick={() => setOpen((v) => !v)}
+          onMouseEnter={() => setChevHovered(true)}
+          onMouseLeave={() => setChevHovered(false)}
+          onFocus={() => setChevHovered(true)}
+          onBlur={() => setChevHovered(false)}
+          aria-label="Выбрать качество трансляции"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          title="Выбрать качество"
+        >
+          <ChevronUpIcon />
+        </button>
+      )}
+
+      {open && !active && (
+        <div role="listbox" aria-label="Качество трансляции экрана" style={dropdownStyle}>
+          <div style={headerStyle}>Качество</div>
+          {(Object.keys(SCREEN_QUALITY_PRESETS) as ScreenQuality[]).map((q) => {
+            const preset = SCREEN_QUALITY_PRESETS[q];
+            const selected = q === quality;
+            return (
+              <button
+                key={q}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                style={itemStyle(selected)}
+                onClick={() => handleQualityClick(q)}
+              >
+                {preset.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Controls({
   micOn,
   camOn,
   screenSharing,
+  screenQuality,
   onToggleMic,
   onToggleCam,
   onToggleScreenShare,
+  onChangeScreenQuality,
   onLeave,
   onCopyInvite,
 }: Props) {
@@ -279,14 +539,12 @@ export default function Controls({
         <CamIcon off={!camOn} />
       </CircleButton>
 
-      <CircleButton
-        variant={screenSharing ? 'active' : 'default'}
-        onClick={onToggleScreenShare}
-        pressed={screenSharing}
-        ariaLabel={screenSharing ? 'Остановить трансляцию' : 'Транслировать экран'}
-      >
-        <ScreenShareIcon active={screenSharing} />
-      </CircleButton>
+      <ScreenShareControl
+        active={screenSharing}
+        quality={screenQuality}
+        onToggle={onToggleScreenShare}
+        onChangeQuality={onChangeScreenQuality}
+      />
 
       <CircleButton
         variant="default"

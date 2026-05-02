@@ -1,5 +1,10 @@
 import { SignalClient } from './signal';
 import { PUBLIC_ICE_SERVERS } from './ice';
+import {
+  DEFAULT_SCREEN_QUALITY,
+  getScreenQualityPreset,
+  type ScreenQuality,
+} from './screen-quality';
 import type {
   Envelope,
   PeerInfo,
@@ -196,7 +201,15 @@ export class MeetConnection {
 
   // ─── screen sharing ────────────────────────────────────────────────────────
 
-  async startScreenShare(): Promise<MediaStream> {
+  /**
+   * Запускает screen-share с заданным quality preset.
+   *
+   * @param quality preset (default 'hd'). Влияет на ideal width/height/frameRate
+   *   в getDisplayMedia + maxBitrate в setParameters.
+   */
+  async startScreenShare(
+    quality: ScreenQuality = DEFAULT_SCREEN_QUALITY,
+  ): Promise<MediaStream> {
     if (this.screenStream) {
       return this.screenStream;
     }
@@ -204,20 +217,42 @@ export class MeetConnection {
     if (!pc) {
       throw new Error('startScreenShare: publishPC not ready');
     }
+
+    const preset = getScreenQualityPreset(quality);
+
     const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30 } },
+      video: {
+        width: { ideal: preset.width },
+        height: { ideal: preset.height },
+        frameRate: { ideal: preset.frameRate },
+      },
       audio: false,
     });
 
     // Запоминаем до renegotiate, чтобы отслеживать onended даже если SDP-обмен фейлит.
     this.screenStream = stream;
 
+    // contentHint='detail' для screen-tracks: encoder приоритезирует резкость
+    // деталей (текст, UI) над плавностью движения. Для камер уже выставлен
+    // 'motion' upstream'ом (Meeting.tsx → start) — здесь не трогаем не свои треки.
+    for (const track of stream.getVideoTracks()) {
+      try {
+        track.contentHint = 'detail';
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const screenSenders: RTCRtpSender[] = [];
     for (const track of stream.getTracks()) {
       const transceiver = pc.addTransceiver(track, {
         direction: 'sendonly',
         streams: [stream],
       });
       this.screenSenders.add(transceiver.sender);
+      if (track.kind === 'video') {
+        screenSenders.push(transceiver.sender);
+      }
       // Если пользователь нажал "Stop sharing" в браузерном UI — стопим сами.
       track.onended = () => {
         // Чтобы не перевызвать stop рекурсивно, защищаемся проверкой.
@@ -233,6 +268,28 @@ export class MeetConnection {
       this.signal.send<SDPData>('publish-offer', { sdp: offer.sdp ?? '' });
     } catch (err) {
       this.reportError(err, 'startScreenShare renegotiate');
+    }
+
+    // После renegotiate выставляем encoding-параметры для screen-sender'ов:
+    //  - maxBitrate из preset (cap чтобы не уйти в overshoot на быстром канале)
+    //  - degradationPreference 'maintain-resolution' — при просадке канала
+    //    роняем fps, но НЕ разрешение. Текст должен оставаться читабельным.
+    //  - networkPriority 'high'
+    for (const sender of screenSenders) {
+      try {
+        const params = sender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        for (const e of params.encodings) {
+          e.maxBitrate = preset.maxBitrate;
+          e.networkPriority = 'high';
+        }
+        params.degradationPreference = 'maintain-resolution';
+        await sender.setParameters(params);
+      } catch (err) {
+        this.reportError(err, 'startScreenShare setParameters');
+      }
     }
 
     try {
