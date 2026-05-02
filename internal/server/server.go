@@ -32,10 +32,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/AntonZubritski/ZubraMeet/internal/cloudconfig"
+	"github.com/AntonZubritski/ZubraMeet/internal/cloudrelay"
 	"github.com/AntonZubritski/ZubraMeet/internal/connectivity"
 	"github.com/AntonZubritski/ZubraMeet/internal/nat"
 	"github.com/AntonZubritski/ZubraMeet/internal/room"
@@ -43,6 +46,15 @@ import (
 	"github.com/AntonZubritski/ZubraMeet/internal/signal"
 	"github.com/AntonZubritski/ZubraMeet/internal/tlsutil"
 )
+
+// relayManager — узкий интерфейс над cloudrelay.Manager, чтобы Server не был
+// жёстко завязан на конкретный тип (упрощает тестирование и stub-режим).
+type relayManager interface {
+	Start(ctx context.Context) (*cloudrelay.Relay, error)
+	Active() *cloudrelay.Relay
+	Stop(ctx context.Context) error
+	Recover(ctx context.Context) error
+}
 
 // Config — параметры сервера.
 type Config struct {
@@ -71,6 +83,10 @@ type Server struct {
 	// diagnosis — результат авто-диагностики reachability сервера из интернета.
 	// Заполняется в Run() после tryUPnP. Читается /api/connectivity.
 	diagnosis connectivity.Diagnosis
+
+	// relayMgr — менеджер cloud-relay (TURN-VM в облаке для CGNAT-обхода).
+	// nil если cloudconfig disabled или не сконфигурирован.
+	relayMgr relayManager
 }
 
 // defaultSTUN возвращает дефолтный список ICE-серверов. Используется когда
@@ -98,12 +114,75 @@ func New(cfg Config) *Server {
 
 	hub := signal.NewHub(rooms, &sfuAdapter{sfu: sfuInst})
 
-	return &Server{
+	s := &Server{
 		cfg:   cfg,
 		rooms: rooms,
 		sfu:   sfuInst,
 		hub:   hub,
 	}
+
+	// Cloud relay manager — best effort. Любые ошибки конфига не должны
+	// мешать поднять сервер: в худшем случае relayMgr остаётся nil и
+	// /api/relay/* отдадут 503 (см. handlers).
+	if mgr := buildRelayManager(); mgr != nil {
+		s.relayMgr = mgr
+	}
+
+	return s
+}
+
+// buildRelayManager читает ~/.zubrameet/cloud.json и собирает Manager если
+// конфиг enabled и провайдер поддерживается. Возвращает nil если что-то не
+// так — это норма (cloud-relay опциональный).
+func buildRelayManager() relayManager {
+	cfg, err := cloudconfig.Load()
+	if err != nil {
+		log.Printf("[cloud] config load failed: %v — cloud relay disabled", err)
+		return nil
+	}
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	if cfg.Provider == "" || cfg.APIToken == "" {
+		log.Printf("[cloud] config enabled but provider/token missing — cloud relay disabled")
+		return nil
+	}
+
+	var provider cloudrelay.Provider
+	switch cfg.Provider {
+	case "hetzner":
+		provider = cloudrelay.NewHetzner(cfg.APIToken)
+	default:
+		log.Printf("[cloud] unknown provider %q — cloud relay disabled", cfg.Provider)
+		return nil
+	}
+
+	stateDir, err := relayStateDir()
+	if err != nil {
+		log.Printf("[cloud] state dir: %v — cloud relay disabled", err)
+		return nil
+	}
+
+	mgr, err := cloudrelay.NewManager(cloudrelay.ManagerConfig{
+		Provider: provider,
+		Region:   cfg.Region,
+		StateDir: stateDir,
+	})
+	if err != nil {
+		log.Printf("[cloud] manager init failed: %v — cloud relay disabled", err)
+		return nil
+	}
+	return mgr
+}
+
+// relayStateDir возвращает ~/.zubrameet/relay-state — директория для
+// перезагрузко-устойчивого state'а Manager (active relay info).
+func relayStateDir() (string, error) {
+	cfgPath, err := cloudconfig.Path()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "relay-state"), nil
 }
 
 // Run запускает HTTP- и HTTPS-серверы и блокируется до отмены ctx или фатальной
@@ -115,7 +194,7 @@ func New(cfg Config) *Server {
 //  3. Запуск HTTP и HTTPS параллельно. Если сертификат не получился — только HTTP.
 func (s *Server) Run(ctx context.Context) error {
 	mux := s.routes()
-	log.Printf("[http] routes registered: GET /api/health, GET /api/connectivity, POST /api/rooms, GET /api/rooms/{id}, GET /ws, GET /*")
+	log.Printf("[http] routes registered: GET /api/health, GET /api/connectivity, GET /api/mode, POST /api/rooms, GET /api/rooms/{id}, GET|POST /api/cloudconfig, POST /api/relay/start, GET /api/relay/status, POST /api/relay/stop, GET /ws, GET /*")
 
 	// 1. Парсим HTTPS-порт (нужен для UPnP-mapping).
 	httpsPort, err := parsePort(s.cfg.HTTPSAddr)
@@ -147,6 +226,17 @@ func (s *Server) Run(ctx context.Context) error {
 	s.mu.Unlock()
 	log.Printf("[net] diagnosis: status=%s ipv4=%q ipv6=%q cgnat=%v reasons=%v",
 		d.Status, d.PublicIPv4, d.PublicIPv6, d.BehindCGNAT, d.Reasons)
+
+	// 3b. Cloud relay recovery — если был активный relay при предыдущем
+	// запуске, попытаться вернуть state с диска. Best effort: ошибка только
+	// логируется.
+	if s.relayMgr != nil {
+		if err := s.relayMgr.Recover(ctx); err != nil {
+			log.Printf("[cloud] relay recover failed: %v", err)
+		} else if r := s.relayMgr.Active(); r != nil {
+			log.Printf("[cloud] recovered active relay id=%s ip=%s", r.ID, r.PublicIP)
+		}
+	}
 
 	// 4. TLS cert. Если падает — HTTPS отключён, продолжаем на HTTP.
 	var tlsCert *tls.Certificate
@@ -283,6 +373,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if err := httpsSrv.Shutdown(ctx); err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	// Cloud relay shutdown. Не убиваем VM (это делает сам Manager если хочет
+	// — destroy-on-exit конфигурируется внутри). Просто корректно отпускаем
+	// ресурсы менеджера.
+	if s.relayMgr != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := s.relayMgr.Stop(stopCtx); err != nil {
+			log.Printf("[cloud] relay stop failed: %v", err)
+		}
+		stopCancel()
 	}
 
 	// Снять port mapping. Делаем на отдельном context.Background с коротким

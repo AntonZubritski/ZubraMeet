@@ -2,6 +2,17 @@
 
 P2P-видеоконференции, где **создатель мита становится локальным SFU-сервером**. Один Go-бинарник: Pion SFU + WebSocket-сигналинг + embedded React-app. uTorrent-модель.
 
+## P2P-режим (для хостов за CGNAT)
+
+Веб-клиент задеплоен на GitHub Pages: https://antonzubritski.github.io/ZubraMeet/
+
+Когда хост за CGNAT, ZubraMeet автоматически переключается в P2P-mesh-режим
+с decentralized signaling через Nostr-relay'и (через библиотеку trystero).
+Видео идёт прямо peer-to-peer, никакого сервера не требуется.
+
+Гость открывает https://antonzubritski.github.io/ZubraMeet/p2p/<roomId> →
+браузер находит хоста через Nostr → WebRTC mesh.
+
 ## Стек
 
 - **Backend**: Go 1.26 + [Pion WebRTC](https://github.com/pion/webrtc) + [coder/websocket](https://github.com/coder/websocket)

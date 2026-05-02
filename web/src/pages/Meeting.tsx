@@ -1,4 +1,14 @@
 // Страница встречи: захват камеры/микрофона, сигналинг, WebRTC, рендер сетки.
+//
+// Поддерживает два режима:
+// - SFU: текущий — WS-сигналинг к нашему серверу + MeetConnection (publish/subscribe PC)
+// - P2P: mesh через Trystero/Nostr — P2PMeetConnection. Без своего WS-сервера.
+//
+// Mode resolution:
+// - props.mode === 'sfu'  → SFU
+// - props.mode === 'p2p'  → P2P
+// - props.mode === 'auto' (default) → fetch /api/mode → { mode: 'sfu'|'p2p' }.
+//   404/network err → fallback на P2P (например, при деплое статики на GitHub Pages).
 import {
   useEffect,
   useRef,
@@ -8,6 +18,7 @@ import {
 import { navigate } from '../App';
 import { SignalClient, buildWsUrl } from '../lib/signal';
 import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
+import { P2PMeetConnection, type P2PMeetEvents } from '../lib/p2p';
 import type {
   ConnectionStats,
   ConnectivityResp,
@@ -15,13 +26,18 @@ import type {
   Endpoint,
   EndpointKind,
   PeerInfo,
+  RelayInfo,
+  RelayStatusResp,
 } from '../types';
 import VideoGrid from '../components/VideoGrid';
 import Controls from '../components/Controls';
 import ConnectionBadge from '../components/ConnectionBadge';
 
+type Mode = 'sfu' | 'p2p';
+
 interface Props {
   roomId: string;
+  mode?: 'auto' | 'sfu' | 'p2p';
 }
 
 interface PeerEntry {
@@ -31,6 +47,11 @@ interface PeerEntry {
 
 const NAME_KEY = 'zubrameet.name';
 const STATS_INTERVAL_MS = 2000;
+
+// Публичный URL статики, на который ссылаются P2P-инвайты независимо от того,
+// где запущен хост (localhost / behind CGNAT / etc). Гость идёт на этот URL и
+// поднимает Trystero-комнату с тем же roomId через Nostr.
+const P2P_PUBLIC_HOST = 'https://antonzubritski.github.io/ZubraMeet';
 
 const pageStyle: CSSProperties = {
   display: 'flex',
@@ -77,11 +98,45 @@ const inviteBtnStyle: CSSProperties = {
   cursor: 'pointer',
 };
 
+const relayBadgeStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 6,
+  padding: '4px 8px',
+  background: 'rgba(34, 197, 94, 0.12)',
+  border: '1px solid rgba(34, 197, 94, 0.4)',
+  color: 'var(--accent)',
+  borderRadius: 6,
+  fontSize: 11,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+};
+
+const relayStopBtnStyle: CSSProperties = {
+  background: 'transparent',
+  border: '1px solid currentColor',
+  color: 'inherit',
+  padding: '2px 6px',
+  borderRadius: 4,
+  cursor: 'pointer',
+  fontSize: 10,
+};
+
 const resBadgeStyle: CSSProperties = {
   fontSize: 11,
   color: 'var(--muted)',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   cursor: 'help',
+};
+
+const modeBadgeStyle: CSSProperties = {
+  fontSize: 11,
+  padding: '2px 8px',
+  borderRadius: 4,
+  border: '1px solid var(--border)',
+  background: 'var(--bg)',
+  color: 'var(--muted)',
+  cursor: 'help',
+  whiteSpace: 'nowrap',
 };
 
 const gridContainerStyle: CSSProperties = {
@@ -231,6 +286,25 @@ const ENDPOINT_KIND_META: Record<EndpointKind, { icon: string; label: string }> 
   internet: { icon: '🌍', label: 'Интернет' },
 };
 
+// formatRelayDuration форматирует Math.floor(seconds) → "Xч Ym" / "Ym Zс".
+function formatRelayDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}ч ${m}м`;
+  if (m > 0) return `${m}м ${s}с`;
+  return `${s}с`;
+}
+
+// formatRelayCost: HOUR_PRICE_EUR=0.006 (Hetzner cx22 ≈ €0.006/час).
+function formatRelayCost(ms: number): string {
+  const HOUR_PRICE_EUR = 0.006;
+  const hours = ms / 3_600_000;
+  const cost = hours * HOUR_PRICE_EUR;
+  return `€${cost.toFixed(4)}`;
+}
+
 function getVideoSize(stream: MediaStream | null): { w: number; h: number } | null {
   if (!stream) return null;
   const v = stream.getVideoTracks()[0];
@@ -242,7 +316,31 @@ function getVideoSize(stream: MediaStream | null): { w: number; h: number } | nu
   return { w, h };
 }
 
-export default function Meeting({ roomId }: Props) {
+/**
+ * Резолвит mode для встречи.
+ * - 'sfu' / 'p2p' — возвращаем как есть.
+ * - 'auto' — спрашиваем сервер /api/mode. На любую ошибку (404, network, parse)
+ *   фолбэк на 'p2p' (статика без сервера = только P2P).
+ */
+async function resolveMode(prop: 'auto' | 'sfu' | 'p2p'): Promise<Mode> {
+  if (prop === 'sfu' || prop === 'p2p') return prop;
+  try {
+    const r = await fetch('/api/mode');
+    if (!r.ok) return 'p2p';
+    const data = (await r.json()) as { mode?: unknown };
+    if (data.mode === 'sfu' || data.mode === 'p2p') return data.mode;
+    return 'p2p';
+  } catch {
+    return 'p2p';
+  }
+}
+
+export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
+  // Резолвится один раз на mount; до этого UI ждёт.
+  const [resolvedMode, setResolvedMode] = useState<Mode | null>(
+    modeProp === 'sfu' || modeProp === 'p2p' ? modeProp : null,
+  );
+
   // localStream + peers + ui-флаги
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
@@ -255,6 +353,7 @@ export default function Meeting({ roomId }: Props) {
   const [reconnecting, setReconnecting] = useState<boolean>(false);
   const [reconnectAttempt, setReconnectAttempt] = useState<number>(0);
   // Share-panel state (host-only — гости получат 403 и панель не отрисуется).
+  // В P2P-режиме всю панель не показываем (используется одна кнопка "copy link").
   const [endpoints, setEndpoints] = useState<Endpoint[] | null>(null);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [endpointsErr, setEndpointsErr] = useState<string | null>(null);
@@ -262,9 +361,17 @@ export default function Meeting({ roomId }: Props) {
   const [showAdvice, setShowAdvice] = useState<boolean>(false);
   const [rechecking, setRechecking] = useState<boolean>(false);
 
+  // Cloud relay state. relay !== null → активная VM в облаке (TURN-сервер).
+  // tickMs обновляется каждую секунду чтобы перерисовывать стоимость и uptime.
+  const [relay, setRelay] = useState<RelayInfo | null>(null);
+  const [relayBusy, setRelayBusy] = useState<boolean>(false);
+  const [relayError, setRelayError] = useState<string | null>(null);
+  const [, setNowTick] = useState<number>(0);
+
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
-  const connectionRef = useRef<MeetConnection | null>(null);
+  const sfuConnectionRef = useRef<MeetConnection | null>(null);
+  const p2pConnectionRef = useRef<P2PMeetConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const statsTimerRef = useRef<number | null>(null);
   const recoveringRef = useRef<boolean>(false);
@@ -282,8 +389,21 @@ export default function Meeting({ roomId }: Props) {
     }
   })();
 
+  // Mode resolution. Запускаем только если mode prop = 'auto' и ещё не резолвили.
+  useEffect(() => {
+    if (resolvedMode !== null) return;
+    let cancelled = false;
+    void resolveMode(modeProp).then((m) => {
+      if (!cancelled) setResolvedMode(m);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [modeProp, resolvedMode]);
+
   // Recover camera/microphone после sleep/wake.
   // Останавливаем старые треки, getUserMedia заново, replaceLocalTracks на publishPC.
+  // В P2P-режиме replaceLocalTracks не реализован — просто обновляем local-state.
   const recoverMedia = async (): Promise<void> => {
     if (recoveringRef.current) return;
     recoveringRef.current = true;
@@ -319,7 +439,7 @@ export default function Meeting({ roomId }: Props) {
       localStreamRef.current = newStream;
       setLocalStream(newStream);
 
-      const conn = connectionRef.current;
+      const conn = sfuConnectionRef.current;
       if (conn) {
         try {
           await conn.replaceLocalTracks(newStream);
@@ -327,6 +447,9 @@ export default function Meeting({ roomId }: Props) {
           console.error('[Meeting] recoverMedia: replaceLocalTracks failed', err);
         }
       }
+      // P2P: replace на лету не делаем — Trystero сам не предоставляет
+      // удобного API для bulk-replace; при wake-from-sleep пользователь всё
+      // равно почти всегда переподключается. Оставляем как известное ограничение.
     } finally {
       recoveringRef.current = false;
     }
@@ -357,8 +480,10 @@ export default function Meeting({ roomId }: Props) {
     }
   };
 
-  // Главный lifecycle: одна setup-функция, один cleanup.
+  // Главный lifecycle: одна setup-функция, один cleanup. Стартует только
+  // когда resolvedMode известен (для 'auto' сначала ждём /api/mode).
   useEffect(() => {
+    if (resolvedMode === null) return;
     if (startedRef.current) return;
     startedRef.current = true;
 
@@ -369,13 +494,21 @@ export default function Meeting({ roomId }: Props) {
         window.clearInterval(statsTimerRef.current);
         statsTimerRef.current = null;
       }
-      if (connectionRef.current) {
+      if (sfuConnectionRef.current) {
         try {
-          connectionRef.current.close();
+          sfuConnectionRef.current.close();
         } catch {
           /* ignore */
         }
-        connectionRef.current = null;
+        sfuConnectionRef.current = null;
+      }
+      if (p2pConnectionRef.current) {
+        try {
+          p2pConnectionRef.current.close();
+        } catch {
+          /* ignore */
+        }
+        p2pConnectionRef.current = null;
       }
       if (signalRef.current) {
         try {
@@ -423,134 +556,11 @@ export default function Meeting({ roomId }: Props) {
       setLocalStream(stream);
       attachTrackListeners(stream);
 
-      // 2. Сигналинг.
-      const signal = new SignalClient(buildWsUrl(roomId, myName));
-      signalRef.current = signal;
-      try {
-        await signal.connect();
-      } catch (err) {
-        if (cancelled) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        setError(`Не удалось подключиться к серверу: ${msg}`);
-        return;
+      if (resolvedMode === 'sfu') {
+        await startSfu(stream, cancelled);
+      } else {
+        await startP2P(stream, cancelled);
       }
-      if (cancelled) return;
-
-      // 3. WebRTC events.
-      const events: MeetConnectionEvents = {
-        onLocalStream: () => {
-          // localStream уже в state.
-        },
-        onRemoteTrack: (peerId, track, remoteStream) => {
-          // peerId = stream.id (см. webrtc.ts TODO).
-          // Подбираем имя из ранее накопленной мапы: пробуем сначала peerId,
-          // затем stream.id, иначе fallback.
-          const namesMap = peerNamesRef.current;
-          const fallback = namesMap.get(peerId) ?? namesMap.get(remoteStream.id) ?? 'Участник';
-
-          setPeers((prev) => {
-            const next = new Map(prev);
-            const existing = next.get(peerId);
-            if (existing) {
-              // Обновляем track в существующем стриме при необходимости.
-              const has = existing.stream
-                .getTracks()
-                .some((t) => t.id === track.id);
-              if (!has) {
-                try {
-                  existing.stream.addTrack(track);
-                } catch {
-                  /* ignore */
-                }
-              }
-              next.set(peerId, { stream: existing.stream, name: existing.name });
-            } else {
-              next.set(peerId, { stream: remoteStream, name: fallback });
-            }
-            return next;
-          });
-        },
-        onPeerJoined: (peer: PeerInfo) => {
-          peerNamesRef.current.set(peer.id, peer.name);
-          // Обновляем имя в уже существующих записях, если ключ совпал.
-          setPeers((prev) => {
-            if (!prev.has(peer.id)) return prev;
-            const next = new Map(prev);
-            const cur = next.get(peer.id);
-            if (cur) {
-              next.set(peer.id, { stream: cur.stream, name: peer.name });
-            }
-            return next;
-          });
-        },
-        onPeerLeft: (peerId: string) => {
-          peerNamesRef.current.delete(peerId);
-          setPeers((prev) => {
-            if (!prev.has(peerId)) return prev;
-            const next = new Map(prev);
-            next.delete(peerId);
-            return next;
-          });
-        },
-        onConnectionState: () => {
-          // Состояние можно отрисовать позднее; ConnectionBadge сейчас читает stats.
-        },
-        onError: (err: Error) => {
-          // Логируем, но не валим UI: ошибки сигналинга/WebRTC могут быть некритичными.
-          console.error('[Meeting]', err);
-          if (/signal disconnected/i.test(err.message)) {
-            setReconnecting(true);
-          }
-          if (/reconnect failed/i.test(err.message)) {
-            // Окончательно — показываем error-state.
-            setReconnecting(false);
-            setError(err.message);
-          }
-        },
-        onScreenShareStarted: () => {
-          // Уже выставили в handleToggleScreenShare; этот колбэк нужен на случай
-          // программного запуска screen share в будущем.
-        },
-        onScreenShareStopped: () => {
-          // Может прийти после reconnect или после browser "Stop sharing".
-          setScreenSharing(false);
-          setScreenStream(null);
-        },
-        onReconnecting: (attempt: number) => {
-          setReconnecting(true);
-          setReconnectAttempt(attempt);
-        },
-        onReconnected: () => {
-          setReconnecting(false);
-          setReconnectAttempt(0);
-          // После reconnect peers сбрасываются — старые удалятся через peer-left
-          // от сервера новой сессии не придёт, поэтому чистим вручную.
-          peerNamesRef.current.clear();
-          setPeers(new Map());
-        },
-      };
-
-      const conn = new MeetConnection(signal, events);
-      connectionRef.current = conn;
-
-      try {
-        await conn.start(stream);
-      } catch (err) {
-        if (cancelled) return;
-        const msg = err instanceof Error ? err.message : String(err);
-        setError(`Не удалось запустить медиасессию: ${msg}`);
-        return;
-      }
-      if (cancelled) return;
-
-      // 4. Stats poller.
-      statsTimerRef.current = window.setInterval(() => {
-        const c = connectionRef.current;
-        if (!c) return;
-        void c.getStats().then((s) => {
-          setStats(s);
-        });
-      }, STATS_INTERVAL_MS);
     })();
 
     return () => {
@@ -558,7 +568,198 @@ export default function Meeting({ roomId }: Props) {
       cleanup();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId]);
+  }, [roomId, resolvedMode]);
+
+  // Стартует SFU-pipeline: SignalClient + MeetConnection + stats poller.
+  const startSfu = async (stream: MediaStream, cancelled: boolean): Promise<void> => {
+    // 2. Сигналинг.
+    const signal = new SignalClient(buildWsUrl(roomId, myName));
+    signalRef.current = signal;
+    try {
+      await signal.connect();
+    } catch (err) {
+      if (cancelled) return;
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`Не удалось подключиться к серверу: ${msg}`);
+      return;
+    }
+    if (cancelled) return;
+
+    // 3. WebRTC events.
+    const events: MeetConnectionEvents = {
+      onLocalStream: () => {
+        // localStream уже в state.
+      },
+      onRemoteTrack: (peerId, track, remoteStream) => {
+        // peerId = stream.id (см. webrtc.ts TODO).
+        // Подбираем имя из ранее накопленной мапы: пробуем сначала peerId,
+        // затем stream.id, иначе fallback.
+        const namesMap = peerNamesRef.current;
+        const fallback = namesMap.get(peerId) ?? namesMap.get(remoteStream.id) ?? 'Участник';
+
+        setPeers((prev) => {
+          const next = new Map(prev);
+          const existing = next.get(peerId);
+          if (existing) {
+            // Обновляем track в существующем стриме при необходимости.
+            const has = existing.stream
+              .getTracks()
+              .some((t) => t.id === track.id);
+            if (!has) {
+              try {
+                existing.stream.addTrack(track);
+              } catch {
+                /* ignore */
+              }
+            }
+            next.set(peerId, { stream: existing.stream, name: existing.name });
+          } else {
+            next.set(peerId, { stream: remoteStream, name: fallback });
+          }
+          return next;
+        });
+      },
+      onPeerJoined: (peer: PeerInfo) => {
+        peerNamesRef.current.set(peer.id, peer.name);
+        // Обновляем имя в уже существующих записях, если ключ совпал.
+        setPeers((prev) => {
+          if (!prev.has(peer.id)) return prev;
+          const next = new Map(prev);
+          const cur = next.get(peer.id);
+          if (cur) {
+            next.set(peer.id, { stream: cur.stream, name: peer.name });
+          }
+          return next;
+        });
+      },
+      onPeerLeft: (peerId: string) => {
+        peerNamesRef.current.delete(peerId);
+        setPeers((prev) => {
+          if (!prev.has(peerId)) return prev;
+          const next = new Map(prev);
+          next.delete(peerId);
+          return next;
+        });
+      },
+      onConnectionState: () => {
+        // Состояние можно отрисовать позднее; ConnectionBadge сейчас читает stats.
+      },
+      onError: (err: Error) => {
+        // Логируем, но не валим UI: ошибки сигналинга/WebRTC могут быть некритичными.
+        console.error('[Meeting]', err);
+        if (/signal disconnected/i.test(err.message)) {
+          setReconnecting(true);
+        }
+        if (/reconnect failed/i.test(err.message)) {
+          // Окончательно — показываем error-state.
+          setReconnecting(false);
+          setError(err.message);
+        }
+      },
+      onScreenShareStarted: () => {
+        // Уже выставили в handleToggleScreenShare; этот колбэк нужен на случай
+        // программного запуска screen share в будущем.
+      },
+      onScreenShareStopped: () => {
+        // Может прийти после reconnect или после browser "Stop sharing".
+        setScreenSharing(false);
+        setScreenStream(null);
+      },
+      onReconnecting: (attempt: number) => {
+        setReconnecting(true);
+        setReconnectAttempt(attempt);
+      },
+      onReconnected: () => {
+        setReconnecting(false);
+        setReconnectAttempt(0);
+        // После reconnect peers сбрасываются — старые удалятся через peer-left
+        // от сервера новой сессии не придёт, поэтому чистим вручную.
+        peerNamesRef.current.clear();
+        setPeers(new Map());
+      },
+    };
+
+    const conn = new MeetConnection(signal, events);
+    sfuConnectionRef.current = conn;
+
+    try {
+      await conn.start(stream);
+    } catch (err) {
+      if (cancelled) return;
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`Не удалось запустить медиасессию: ${msg}`);
+      return;
+    }
+    if (cancelled) return;
+
+    // 4. Stats poller.
+    statsTimerRef.current = window.setInterval(() => {
+      const c = sfuConnectionRef.current;
+      if (!c) return;
+      void c.getStats().then((s) => {
+        setStats(s);
+      });
+    }, STATS_INTERVAL_MS);
+  };
+
+  // Стартует P2P-pipeline: P2PMeetConnection через Trystero/Nostr.
+  // Без своего WS, без stats-poller (Trystero не выставляет агрегированные stats).
+  const startP2P = async (stream: MediaStream, cancelled: boolean): Promise<void> => {
+    const myDisplay = myName.trim().length > 0 ? myName : 'Гость';
+    const events: P2PMeetEvents = {
+      onLocalStream: () => {
+        // уже в state.
+      },
+      onRemoteStream: (peerId, remoteStream, name) => {
+        setPeers((prev) => {
+          const next = new Map(prev);
+          next.set(peerId, { stream: remoteStream, name });
+          return next;
+        });
+      },
+      onPeerJoined: (peerId, name) => {
+        peerNamesRef.current.set(peerId, name);
+        // Если поток уже есть — обновляем имя.
+        setPeers((prev) => {
+          if (!prev.has(peerId)) return prev;
+          const next = new Map(prev);
+          const cur = next.get(peerId);
+          if (cur) {
+            next.set(peerId, { stream: cur.stream, name });
+          }
+          return next;
+        });
+      },
+      onPeerLeft: (peerId) => {
+        peerNamesRef.current.delete(peerId);
+        setPeers((prev) => {
+          if (!prev.has(peerId)) return prev;
+          const next = new Map(prev);
+          next.delete(peerId);
+          return next;
+        });
+      },
+      onConnectionState: () => {
+        // Не показываем per-peer состояние в UI — только агрегат через ConnectionBadge.
+      },
+      onError: (err) => {
+        console.error('[Meeting/p2p]', err);
+        // P2P-ошибки в целом не валят сессию (Nostr-relay может временно отвалиться).
+      },
+    };
+
+    const conn = new P2PMeetConnection(roomId, myDisplay, events);
+    p2pConnectionRef.current = conn;
+
+    try {
+      await conn.start(stream);
+    } catch (err) {
+      if (cancelled) return;
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`Не удалось подключиться к P2P-комнате: ${msg}`);
+      return;
+    }
+  };
 
   // visibilitychange → если вкладка снова видна и треки сломаны, восстановить.
   useEffect(() => {
@@ -580,8 +781,102 @@ export default function Meeting({ roomId }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch connectivity options. Only хост (с localhost) получит 200; гости — 403.
+  // Polling /api/relay/status каждые 30с. Гостям сервер отдаст 403 — silently
+  // skip. tick-таймер раз в 1с перерисовывает duration/cost-индикатор.
   useEffect(() => {
+    let cancelled = false;
+    const fetchRelay = (): void => {
+      fetch('/api/relay/status')
+        .then(async (r) => {
+          if (r.status === 403) return null;
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return (await r.json()) as RelayStatusResp;
+        })
+        .then((d) => {
+          if (cancelled) return;
+          if (!d || !d.active) {
+            setRelay(null);
+          } else {
+            // d — RelayInfo + active:true. TS narrowing уже это знает.
+            const { active: _ignored, ...info } = d;
+            setRelay(info as RelayInfo);
+          }
+        })
+        .catch(() => {
+          // Network error / endpoint missing — silently skip; индикатор просто не покажется.
+        });
+    };
+    fetchRelay();
+    const pollId = window.setInterval(fetchRelay, 30_000);
+    const tickId = window.setInterval(() => setNowTick((t) => t + 1), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(pollId);
+      window.clearInterval(tickId);
+    };
+  }, []);
+
+  const handleStartRelay = (): void => {
+    if (relayBusy) return;
+    setRelayBusy(true);
+    setRelayError(null);
+    fetch('/api/relay/start', { method: 'POST' })
+      .then(async (r) => {
+        if (r.status === 403) {
+          setRelayError('Запуск relay доступен только на машине хоста.');
+          return null;
+        }
+        if (r.status === 503) {
+          // Cloud-relay не сконфигурирован — отправляем на /settings.
+          navigate('/settings?provider=hetzner');
+          return null;
+        }
+        const data = (await r.json()) as { error?: string } & Partial<RelayInfo>;
+        if (!r.ok) {
+          throw new Error(data.error ?? `HTTP ${r.status}`);
+        }
+        return data as RelayInfo;
+      })
+      .then((info) => {
+        if (info && info.id) {
+          setRelay(info);
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        setRelayError(msg);
+      })
+      .finally(() => {
+        setRelayBusy(false);
+      });
+  };
+
+  const handleStopRelay = (): void => {
+    if (relayBusy) return;
+    setRelayBusy(true);
+    setRelayError(null);
+    fetch('/api/relay/stop', { method: 'POST' })
+      .then(async (r) => {
+        if (r.status === 403) return;
+        if (!r.ok) {
+          const data = (await r.json().catch(() => ({}))) as { error?: string };
+          throw new Error(data.error ?? `HTTP ${r.status}`);
+        }
+        setRelay(null);
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        setRelayError(msg);
+      })
+      .finally(() => {
+        setRelayBusy(false);
+      });
+  };
+
+  // Fetch connectivity options. Только в SFU-режиме (в P2P нет /api/connectivity).
+  // Только хост (с localhost) получит 200; гости — 403.
+  useEffect(() => {
+    if (resolvedMode !== 'sfu') return;
     let cancelled = false;
     fetch('/api/connectivity')
       .then(async (r) => {
@@ -607,7 +902,7 @@ export default function Meeting({ roomId }: Props) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [resolvedMode]);
 
   const handleRecheck = (): void => {
     if (rechecking) return;
@@ -676,7 +971,9 @@ export default function Meeting({ roomId }: Props) {
   };
 
   const handleToggleScreenShare = (): void => {
-    const conn = connectionRef.current;
+    // Screen share пока работает только в SFU-режиме (Trystero-API для замены/добавления
+    // sender'ов на лету усложняется при mesh — оставляем на будущее).
+    const conn = sfuConnectionRef.current;
     if (!conn) return;
     if (screenSharing) {
       void conn
@@ -715,13 +1012,21 @@ export default function Meeting({ roomId }: Props) {
       window.clearInterval(statsTimerRef.current);
       statsTimerRef.current = null;
     }
-    if (connectionRef.current) {
+    if (sfuConnectionRef.current) {
       try {
-        connectionRef.current.close();
+        sfuConnectionRef.current.close();
       } catch {
         /* ignore */
       }
-      connectionRef.current = null;
+      sfuConnectionRef.current = null;
+    }
+    if (p2pConnectionRef.current) {
+      try {
+        p2pConnectionRef.current.close();
+      } catch {
+        /* ignore */
+      }
+      p2pConnectionRef.current = null;
     }
     if (signalRef.current) {
       try {
@@ -745,8 +1050,17 @@ export default function Meeting({ roomId }: Props) {
     navigate('/');
   };
 
+  // Invite link. В P2P — статика на GitHub Pages с тем же roomId. В SFU —
+  // origin текущей страницы + /m/<roomId>.
+  const buildInviteUrl = (): string => {
+    if (resolvedMode === 'p2p') {
+      return `${P2P_PUBLIC_HOST}/p2p/${roomId}`;
+    }
+    return `${window.location.origin}/m/${roomId}`;
+  };
+
   const handleCopyInvite = (): void => {
-    const url = `${window.location.origin}/m/${roomId}`;
+    const url = buildInviteUrl();
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       void navigator.clipboard
         .writeText(url)
@@ -768,6 +1082,23 @@ export default function Meeting({ roomId }: Props) {
         hint="Проверьте, что в браузере разрешён доступ к камере и микрофону для этого сайта."
         onBack={() => navigate('/')}
       />
+    );
+  }
+
+  // Пока mode не резолвится — рисуем минимальный loader, чтобы не дёргать
+  // setup-эффект с null'ом.
+  if (resolvedMode === null) {
+    return (
+      <div style={pageStyle}>
+        <div style={headerStyle}>
+          <h1 style={titleStyle}>
+            Мит <span style={roomIdStyle}>{roomId}</span>
+          </h1>
+        </div>
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>
+          Определяю режим подключения…
+        </div>
+      </div>
     );
   }
 
@@ -819,10 +1150,16 @@ export default function Meeting({ roomId }: Props) {
     : 'Локальное видео: только аудио';
   const resBadge = size ? `${size.w}×${size.h}` : 'audio-only';
 
-  // Подготовка строк для share-panel (только если endpoints получены).
-  const showSharePanel = endpoints !== null;
+  // Подготовка строк для share-panel (только если SFU + endpoints получены).
+  const showSharePanel = resolvedMode === 'sfu' && endpoints !== null;
   const hasIPv6 =
     diagnosis !== null && diagnosis.publicIPv6.length > 0;
+
+  const modeBadgeLabel = resolvedMode === 'p2p' ? '🌐 P2P-режим' : '📡 SFU-режим';
+  const modeBadgeTitle =
+    resolvedMode === 'p2p'
+      ? 'P2P: видео идёт напрямую между всеми (mesh через Nostr-сигналинг). Хорошо для маленьких комнат и хостов за CGNAT.'
+      : 'SFU: видео идёт через хоста-сервер. Лучше масштабируется на много участников.';
 
   return (
     <div style={pageStyle}>
@@ -830,10 +1167,38 @@ export default function Meeting({ roomId }: Props) {
         <h1 style={titleStyle}>
           Мит <span style={roomIdStyle}>{roomId}</span>
         </h1>
-        <ConnectionBadge stats={stats} />
+        <span style={modeBadgeStyle} title={modeBadgeTitle}>
+          {modeBadgeLabel}
+        </span>
+        {resolvedMode === 'sfu' && <ConnectionBadge stats={stats} />}
         <span style={resBadgeStyle} title={resTitle}>
           {resBadge}
         </span>
+        {relay && (() => {
+          // Парсим createdAt → Date. Если невалидный — fallback на 0 длительность.
+          const createdMs = (() => {
+            const t = Date.parse(relay.createdAt);
+            return Number.isFinite(t) ? t : Date.now();
+          })();
+          const elapsed = Date.now() - createdMs;
+          const dur = formatRelayDuration(elapsed);
+          const cost = formatRelayCost(elapsed);
+          return (
+            <span style={relayBadgeStyle} title={`TURN ${relay.publicIP}:${relay.turnPort}`}>
+              <span aria-hidden="true">🌐</span>
+              <span>Relay активен · €0.006/час · ~{dur} · {cost}</span>
+              <button
+                type="button"
+                style={relayStopBtnStyle}
+                onClick={handleStopRelay}
+                disabled={relayBusy}
+                title="Остановить relay"
+              >
+                {relayBusy ? '…' : 'Stop'}
+              </button>
+            </span>
+          );
+        })()}
         <button type="button" style={inviteBtnStyle} onClick={handleCopyInvite}>
           Скопировать ссылку
         </button>
@@ -932,7 +1297,18 @@ export default function Meeting({ roomId }: Props) {
                   Ты за CGNAT провайдера — гости из интернета не подключатся
                   напрямую
                 </span>
-                <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  {!relay && (
+                    <button
+                      type="button"
+                      className="diagnosis-relay-start"
+                      onClick={handleStartRelay}
+                      disabled={relayBusy}
+                      title="Поднять временную VM в облаке для TURN-relay"
+                    >
+                      {relayBusy ? 'Создаю VM… 30 сек' : '🚀 Запустить временный relay (€0.006/час)'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="diagnosis-recheck"
@@ -950,6 +1326,11 @@ export default function Meeting({ roomId }: Props) {
                   </button>
                 </span>
               </div>
+              {relayError && (
+                <div style={{ fontSize: 12, color: 'var(--danger)' }}>
+                  Ошибка relay: {relayError}
+                </div>
+              )}
               {showAdvice && (
                 <div className="diagnosis-banner-advice">
                   <div>
@@ -993,7 +1374,7 @@ export default function Meeting({ roomId }: Props) {
         </div>
       )}
 
-      {!showSharePanel && endpointsErr && (
+      {!showSharePanel && resolvedMode === 'sfu' && endpointsErr && (
         <div
           style={{
             padding: '10px 16px',

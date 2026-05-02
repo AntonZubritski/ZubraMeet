@@ -1,10 +1,13 @@
 // Корневой компонент. Простой ручной роутинг по window.location.pathname.
-// `/`            → Landing
-// `/m/<roomId>`  → Meeting
-// иначе          → Landing (404 не нужен)
+// `/`              → Landing
+// `/settings`      → Settings (cloud-провайдер + relay)
+// `/m/<roomId>`    → Meeting (mode='auto' — определяет SFU vs P2P через /api/mode)
+// `/p2p/<roomId>`  → Meeting (mode='p2p' — принудительно P2P через Trystero/Nostr)
+// иначе            → Landing (404 не нужен)
 import { useEffect, useState } from 'react';
 import Landing from './pages/Landing';
 import Meeting from './pages/Meeting';
+import Settings from './pages/Settings';
 
 /**
  * Программная навигация. Меняет history + диспатчит popstate, чтобы App-роутинг
@@ -21,10 +24,19 @@ function getPath(): string {
   return window.location.pathname || '/';
 }
 
-function parseRoomId(path: string): string | null {
-  // /m/<roomId>; допускаем хвостовой слэш.
+interface RouteMatch {
+  roomId: string;
+  mode: 'auto' | 'p2p';
+}
+
+function parseRoute(path: string): RouteMatch | null {
+  // /p2p/<roomId> — принудительно P2P. Проверяем ПЕРВЫМ, чтобы не съел /m/.
+  const p2p = /^\/p2p\/([^/]+)\/?$/.exec(path);
+  if (p2p) return { roomId: p2p[1]!, mode: 'p2p' };
+  // /m/<roomId> — auto-detect.
   const m = /^\/m\/([^/]+)\/?$/.exec(path);
-  return m ? m[1]! : null;
+  if (m) return { roomId: m[1]!, mode: 'auto' };
+  return null;
 }
 
 export default function App() {
@@ -40,9 +52,12 @@ export default function App() {
     };
   }, []);
 
-  const roomId = parseRoomId(path);
-  if (roomId) {
-    return <Meeting roomId={roomId} />;
+  if (path === '/settings' || path === '/settings/') {
+    return <Settings />;
+  }
+  const route = parseRoute(path);
+  if (route) {
+    return <Meeting roomId={route.roomId} mode={route.mode} />;
   }
   return <Landing />;
 }

@@ -88,3 +88,68 @@ export interface ConnectivityResp {
   endpoints: Endpoint[];
   diagnosis: Diagnosis;
 }
+
+// Mode — рекомендованный режим работы клиента (определяет /api/mode по
+// результату server-side диагностики).
+export type ServerMode = 'sfu' | 'p2p';
+
+export interface ModeResp {
+  mode: ServerMode;
+  reason: string;
+  diagnosis: Diagnosis;
+}
+
+// CloudProviderRegion — один регион cloud-провайдера.
+export interface CloudProviderRegion {
+  code: string;
+  name: string;
+}
+
+// CloudProviderInfo — описание одного cloud-провайдера для UI Settings.
+export interface CloudProviderInfo {
+  id: string;
+  name: string;
+  regions: CloudProviderRegion[];
+  tokenUrl: string;
+  estimateNote: string;
+}
+
+// CloudConfigResp — ответ GET /api/cloudconfig.
+// hasToken=true — токен сохранён; саму строку сервер не возвращает.
+export interface CloudConfigResp {
+  provider: string;
+  region: string;
+  hasToken: boolean;
+  enabled: boolean;
+  providers: CloudProviderInfo[];
+}
+
+// CloudConfigSavePayload — body для POST /api/cloudconfig. Если apiToken
+// пустая строка — сервер сохранит существующий токен (см. handlers.go).
+export interface CloudConfigSavePayload {
+  provider: string;
+  apiToken: string;
+  region: string;
+  enabled: boolean;
+}
+
+// RelayInfo — публичные поля активного relay-сервера.
+export interface RelayInfo {
+  id: string;
+  provider: string;
+  region: string;
+  publicIP: string;
+  turnPort: number;
+  turnUrl: string;
+  turnUser: string;
+  turnPass: string;
+  createdAt: string; // ISO-8601
+  destroyTTL: string; // ISO-8601
+  costNote: string;
+}
+
+// RelayStatusResp — ответ GET /api/relay/status. Если active=false — других
+// полей может не быть.
+export type RelayStatusResp =
+  | ({ active: true } & RelayInfo)
+  | { active: false };

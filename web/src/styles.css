@@ -163,3 +163,31 @@ html, body, #root {
 }
 
 .diagnosis-recheck:hover { color: var(--fg); }
+
+/* Кнопка "Запустить временный relay" в CGNAT-баннере. */
+.diagnosis-relay-start {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: #0a0a0a;
+  padding: 4px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.diagnosis-relay-start:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.diagnosis-relay-start:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Settings page (cloud config). Стили inline через CSSProperties в
+   pages/Settings.tsx, здесь только мелкие хелперы для select/input focus. */
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent) !important;
+}

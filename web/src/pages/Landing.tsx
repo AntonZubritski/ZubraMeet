@@ -119,6 +119,19 @@ const footerStyle: CSSProperties = {
   textAlign: 'center',
 };
 
+const settingsLinkStyle: CSSProperties = {
+  position: 'fixed',
+  top: 12,
+  right: 16,
+  fontSize: 12,
+  color: 'var(--muted)',
+  textDecoration: 'none',
+  background: 'transparent',
+  border: 'none',
+  cursor: 'pointer',
+  padding: 4,
+};
+
 function disabledOverride(disabled: boolean): CSSProperties {
   if (!disabled) return {};
   return { opacity: 0.5, cursor: 'not-allowed' };
@@ -215,6 +228,14 @@ export default function Landing() {
 
   return (
     <div style={pageStyle}>
+      <button
+        type="button"
+        style={settingsLinkStyle}
+        onClick={() => navigate('/settings')}
+        title="Настройки cloud-провайдера"
+      >
+        ⚙ Настройки
+      </button>
       <div style={containerStyle}>
         <h1 style={titleStyle}>ZubraMeet</h1>
         <p style={subtitleStyle}>Видеоконференции, где ты сам сервер</p>
