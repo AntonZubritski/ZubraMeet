@@ -11,6 +11,20 @@ import type { RoomCreateResp } from '../types';
 
 const NAME_KEY = 'zubrameet.name';
 
+// Crockford base32 без I/L/O/U — совпадает с server-side internal/room.
+const CROCKFORD_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+function generateRoomId(): string {
+  const len = 8;
+  const bytes = new Uint8Array(len);
+  crypto.getRandomValues(bytes);
+  let out = '';
+  for (let i = 0; i < len; i++) {
+    out += CROCKFORD_ALPHABET[bytes[i]! % CROCKFORD_ALPHABET.length];
+  }
+  return out;
+}
+
 const pageStyle: CSSProperties = {
   minHeight: '100%',
   display: 'flex',
@@ -150,20 +164,28 @@ export default function Landing() {
   const [creating, setCreating] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string | null>(null);
+  // serverless = страница хостится без своего ZubraMeet-бэка (например, GitHub Pages).
+  // В этом режиме все миты идут через P2P (/p2p/<id>), без /api/rooms.
+  const [serverless, setServerless] = useState<boolean | null>(null);
 
-  // Подгружаем версию из /api/health.
+  // Подгружаем версию из /api/health и заодно детектим serverless-mode.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
         const resp = await fetch('/api/health');
-        if (!resp.ok) return;
+        if (cancelled) return;
+        if (!resp.ok) {
+          setServerless(true);
+          return;
+        }
+        setServerless(false);
         const data = (await resp.json()) as { ok?: boolean; version?: string };
-        if (!cancelled && typeof data.version === 'string') {
+        if (typeof data.version === 'string') {
           setVersion(data.version);
         }
       } catch {
-        /* молча игнорируем */
+        if (!cancelled) setServerless(true);
       }
     })();
     return () => {
@@ -199,12 +221,22 @@ export default function Landing() {
     setError(null);
     setCreating(true);
     try {
+      // На статике (GitHub Pages) бэка нет — генерим roomId локально и в P2P.
+      if (serverless) {
+        navigate(`/p2p/${generateRoomId()}`);
+        return;
+      }
+      // Локальный сервер: пробуем POST /api/rooms; на ошибку — fallback в P2P.
       const resp = await fetch('/api/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ displayName: trimmedName }),
       });
       if (!resp.ok) {
+        if (resp.status === 405 || resp.status === 404) {
+          navigate(`/p2p/${generateRoomId()}`);
+          return;
+        }
         throw new Error(`HTTP ${resp.status}`);
       }
       const data = (await resp.json()) as RoomCreateResp;
@@ -223,7 +255,7 @@ export default function Landing() {
   const handleJoin = (e: FormEvent): void => {
     e.preventDefault();
     if (joinDisabled) return;
-    navigate(`/m/${trimmedRoom}`);
+    navigate(serverless ? `/p2p/${trimmedRoom}` : `/m/${trimmedRoom}`);
   };
 
   return (
