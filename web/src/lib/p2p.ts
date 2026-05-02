@@ -532,6 +532,49 @@ export class P2PMeetConnection {
         this.reportError(err, 'onConnectionState');
       }
     });
+
+    // Поднимаем потолок bitrate для исходящих видео-треков. По умолчанию
+    // браузер таргетит ~500 kbps на video в WebRTC P2P — для 1080p это
+    // мыло. Ставим 2.5 Mbps; реальный битрейт всё равно адаптируется по
+    // bandwidth estimation, но потолок будет 2.5M вместо 500k.
+    void this.boostVideoBitrate(pc, 2_500_000).catch((err: unknown) => {
+      this.reportError(err, 'boostVideoBitrate');
+    });
+  }
+
+  // Ставит maxBitrate на все sendonly video-tracks этого RTCPeerConnection.
+  // Безопасно вызывать несколько раз — setParameters идемпотентен.
+  // Пробует несколько раз с интервалом, потому что senders создаются async
+  // после addStream — могут отсутствовать в момент первого вызова.
+  private async boostVideoBitrate(
+    pc: RTCPeerConnection,
+    maxBps: number,
+    attempt = 0,
+  ): Promise<void> {
+    let videoSenders = 0;
+    for (const sender of pc.getSenders()) {
+      if (!sender.track || sender.track.kind !== 'video') continue;
+      videoSenders++;
+      const params = sender.getParameters();
+      if (!params.encodings) params.encodings = [{}];
+      let changed = false;
+      for (const e of params.encodings) {
+        if (e.maxBitrate !== maxBps) {
+          e.maxBitrate = maxBps;
+          changed = true;
+        }
+      }
+      if (changed) {
+        await sender.setParameters(params);
+      }
+    }
+    // Если ещё нет видео-senders — ретраим до 5 раз с интервалом 500ms.
+    // Покрывает случай когда initial addStream ещё не завершился.
+    if (videoSenders === 0 && attempt < 5 && !this.closed) {
+      window.setTimeout(() => {
+        void this.boostVideoBitrate(pc, maxBps, attempt + 1);
+      }, 500);
+    }
   }
 
   private reportError(err: unknown, ctx: string): void {

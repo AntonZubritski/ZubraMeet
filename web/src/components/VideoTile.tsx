@@ -34,7 +34,13 @@ const tileStyle: CSSProperties = {
 // 25 — после noise-suppression в getUserMedia это уверенно отделяет тишину
 // и фоновый шум от речи. Слишком высокий порог = не реагирует на тихую речь;
 // слишком низкий = ring загорается от шороха клавиатуры.
-const SPEAKING_THRESHOLD = 25;
+//
+// Hysteresis: чтобы не дребезжало в окрестности порога:
+//   START — выше этого уровня считаем "говорит"
+//   STOP  — ниже этого уровня выключаем (пауза в речи / тишина)
+// Разница ~25 пунктов исключает мерцание на дыхании/фоне.
+const SPEAKING_START = 45;
+const SPEAKING_STOP = 20;
 
 // Placeholder с аватаром накладывается ПОВЕРХ <video> когда камера выключена.
 // position: absolute — чтобы video не размонтировался: srcObject остаётся
@@ -76,16 +82,6 @@ const rippleBaseStyle: CSSProperties = {
   animation: 'zubrameet-ripple 1.6s ease-out infinite',
 };
 
-// Маленький wrap для name-overlay аватара — тоже ripples, только малые.
-const nameOverlayAvatarRippleStyle: CSSProperties = {
-  position: 'absolute',
-  inset: 0,
-  borderRadius: '50%',
-  border: '1.5px solid #22c55e',
-  pointerEvents: 'none',
-  willChange: 'transform, opacity',
-  animation: 'zubrameet-ripple 1.4s ease-out infinite',
-};
 
 const placeholderNameStyle: CSSProperties = {
   fontSize: 'clamp(13px, 1.4vw, 16px)',
@@ -317,11 +313,21 @@ export default function VideoTile({
       let sum = 0;
       for (let i = 0; i < buf.length; i++) sum += buf[i] ?? 0;
       const avg = sum / buf.length;
-      // Маппим 0..255 → 0..100, с лёгким clamp'ом снизу чтобы шум не светился.
-      const level = avg < SPEAKING_THRESHOLD ? 0 : Math.min(100, (avg - SPEAKING_THRESHOLD) * 2);
-      // setState каждый rAF — React 18 батчит, но мы всё равно избегаем
-      // ре-рендера если значение почти то же (округляем до 2 единиц).
-      setVolumeLevel((prev) => (Math.abs(prev - level) < 2 ? prev : level));
+      // Hysteresis-маппинг: ниже SPEAKING_STOP → 0; выше SPEAKING_START →
+      // нормализуем до 0..100; в "серой зоне" между ними — сохраняем prev,
+      // не переключаемся (это и есть hysteresis, защита от мерцания).
+      setVolumeLevel((prev) => {
+        let next: number;
+        if (avg < SPEAKING_STOP) {
+          next = 0;
+        } else if (avg >= SPEAKING_START) {
+          next = Math.min(100, (avg - SPEAKING_START) * 2);
+        } else {
+          // в "серой зоне" — оставляем как есть (на нуле либо на прежнем уровне).
+          next = prev;
+        }
+        return Math.abs(prev - next) < 2 ? prev : next;
+      });
       rafId = window.requestAnimationFrame(tick);
     };
     rafId = window.requestAnimationFrame(tick);
@@ -420,7 +426,18 @@ export default function VideoTile({
   return (
     <div
       ref={containerRef}
-      style={tileStyle}
+      style={{
+        ...tileStyle,
+        // Когда говорит и камера ON — мягкая зелёная обводка вокруг тайла
+        // (вместо ripples, которые видны только на placeholder). При cam-off
+        // обводки нет, потому что внутри уже видны ripples вокруг аватара.
+        ...(speaking && !camMuted
+          ? {
+              boxShadow: '0 0 0 2px #22c55e, 0 0 16px 2px rgba(34, 197, 94, 0.4)',
+              transition: 'box-shadow 100ms linear',
+            }
+          : { transition: 'box-shadow 200ms ease-out' }),
+      }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
@@ -459,12 +476,6 @@ export default function VideoTile({
 
       <div style={nameOverlayStyle} title={name}>
         <span style={nameOverlayAvatarStyle} aria-hidden="true">
-          {speaking && (
-            <>
-              <span style={{ ...nameOverlayAvatarRippleStyle, animationDelay: '0s' }} />
-              <span style={{ ...nameOverlayAvatarRippleStyle, animationDelay: '0.45s' }} />
-            </>
-          )}
           <Avatar size={18} name={name || '?'} variant="beam" colors={AVATAR_COLORS} />
         </span>
         <span>{displayName}</span>
