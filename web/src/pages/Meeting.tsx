@@ -349,6 +349,19 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
     modeProp === 'sfu' || modeProp === 'p2p' ? modeProp : null,
   );
 
+  // Pre-join screen: до setJoined(true) не запускаем getUserMedia/signaling.
+  // Это даёт гостю шанс ввести имя и понять, куда он попал, до того как браузер
+  // спросит разрешение на камеру.
+  const [joined, setJoined] = useState<boolean>(false);
+  const [pendingName, setPendingName] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      return window.localStorage.getItem(NAME_KEY) ?? '';
+    } catch {
+      return '';
+    }
+  });
+
   // localStream + peers + ui-флаги
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
@@ -494,8 +507,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
   };
 
   // Главный lifecycle: одна setup-функция, один cleanup. Стартует только
-  // когда resolvedMode известен (для 'auto' сначала ждём /api/mode).
+  // когда resolvedMode известен (для 'auto' сначала ждём /api/mode) И
+  // пользователь нажал "Присоединиться" (joined === true).
   useEffect(() => {
+    if (!joined) return;
     if (resolvedMode === null) return;
     if (startedRef.current) return;
     startedRef.current = true;
@@ -581,7 +596,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       cleanup();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, resolvedMode]);
+  }, [roomId, resolvedMode, joined]);
 
   // Стартует SFU-pipeline: SignalClient + MeetConnection + stats poller.
   const startSfu = async (stream: MediaStream, cancelled: boolean): Promise<void> => {
@@ -834,7 +849,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
   };
 
   // visibilitychange → если вкладка снова видна и треки сломаны, восстановить.
+  // До join — listener не нужен (никаких треков ещё нет).
   useEffect(() => {
+    if (!joined) return;
     const onVisibility = (): void => {
       if (document.visibilityState !== 'visible') return;
       const ls = localStreamRef.current;
@@ -851,11 +868,13 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       document.removeEventListener('visibilitychange', onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [joined]);
 
   // Polling /api/relay/status каждые 30с. Гостям сервер отдаст 403 — silently
   // skip. tick-таймер раз в 1с перерисовывает duration/cost-индикатор.
+  // Запускаем только после join — до этого relay-индикатор не отрисуется.
   useEffect(() => {
+    if (!joined) return;
     let cancelled = false;
     const fetchRelay = (): void => {
       fetch('/api/relay/status')
@@ -886,7 +905,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       window.clearInterval(pollId);
       window.clearInterval(tickId);
     };
-  }, []);
+  }, [joined]);
 
   const handleStartRelay = (): void => {
     if (relayBusy) return;
@@ -947,7 +966,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
 
   // Fetch connectivity options. Только в SFU-режиме (в P2P нет /api/connectivity).
   // Только хост (с localhost) получит 200; гости — 403.
+  // Запускаем только после join — share-panel всё равно не показывается до join.
   useEffect(() => {
+    if (!joined) return;
     if (resolvedMode !== 'sfu') return;
     let cancelled = false;
     fetch('/api/connectivity')
@@ -974,7 +995,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [resolvedMode]);
+  }, [resolvedMode, joined]);
 
   const handleRecheck = (): void => {
     if (rechecking) return;
@@ -1150,6 +1171,21 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
     }
   };
 
+  // Pre-join: пользователь нажимает "Присоединиться" → сохраняем имя и
+  // выставляем joined=true. Дальше setup-effect выше получит media и поднимет
+  // signaling/peerConnection.
+  const handleJoin = (): void => {
+    const trimmed = pendingName.trim();
+    if (trimmed.length === 0) return;
+    try {
+      window.localStorage.setItem(NAME_KEY, trimmed);
+    } catch {
+      // localStorage может быть недоступен (Safari Private). Не блокируем join —
+      // имя проживёт в текущей вкладке через myName-getter ниже.
+    }
+    setJoined(true);
+  };
+
   if (error) {
     return (
       <ErrorState
@@ -1157,6 +1193,132 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
         hint="Проверьте, что в браузере разрешён доступ к камере и микрофону для этого сайта."
         onBack={() => navigate('/')}
       />
+    );
+  }
+
+  // Pre-join screen — рендерим до того, как пользователь явно согласился
+  // присоединиться. Никакого getUserMedia/signaling/PC до этого момента.
+  if (!joined) {
+    // Лейбл режима для бейджика. Если auto и пока null — "Определяю…".
+    const preJoinModeLabel: string =
+      resolvedMode === 'p2p'
+        ? '🌐 P2P-режим'
+        : resolvedMode === 'sfu'
+        ? '📡 SFU-режим'
+        : 'Определяю режим подключения…';
+
+    const preJoinPageStyle: CSSProperties = {
+      minHeight: '100%',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: 24,
+    };
+    const preJoinContainerStyle: CSSProperties = {
+      width: '100%',
+      maxWidth: 420,
+      background: 'var(--panel)',
+      border: '1px solid var(--border)',
+      borderRadius: 12,
+      padding: '28px 24px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 18,
+    };
+    const preJoinTitleStyle: CSSProperties = {
+      margin: 0,
+      fontSize: 'clamp(22px, 3.5vw, 28px)',
+      fontWeight: 700,
+      textAlign: 'center',
+    };
+    const preJoinSubStyle: CSSProperties = {
+      textAlign: 'center',
+      color: 'var(--muted)',
+      fontSize: 14,
+    };
+    const preJoinLabelStyle: CSSProperties = {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6,
+      fontSize: 13,
+      color: 'var(--muted)',
+    };
+    const preJoinInputStyle: CSSProperties = {
+      width: '100%',
+      padding: '10px 12px',
+      background: 'var(--bg)',
+      border: '1px solid var(--border)',
+      borderRadius: 8,
+      color: 'var(--fg)',
+      fontSize: 15,
+      outline: 'none',
+    };
+    const preJoinBtnStyle: CSSProperties = {
+      width: '100%',
+      padding: '12px 16px',
+      background: 'var(--accent)',
+      color: '#0a0a0a',
+      border: 'none',
+      borderRadius: 8,
+      fontSize: 15,
+      fontWeight: 600,
+      cursor: pendingName.trim().length === 0 ? 'not-allowed' : 'pointer',
+      opacity: pendingName.trim().length === 0 ? 0.5 : 1,
+    };
+    const preJoinModeStyle: CSSProperties = {
+      textAlign: 'center',
+      fontSize: 11,
+      color: 'var(--muted)',
+    };
+    const preJoinRoomIdStyle: CSSProperties = {
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      background: 'var(--bg)',
+      padding: '2px 8px',
+      borderRadius: 4,
+      border: '1px solid var(--border)',
+      fontSize: 13,
+      letterSpacing: 1,
+    };
+
+    return (
+      <div style={preJoinPageStyle}>
+        <div style={preJoinContainerStyle}>
+          <h2 style={preJoinTitleStyle}>Присоединиться к миту</h2>
+          <div style={preJoinSubStyle}>
+            Мит: <code style={preJoinRoomIdStyle}>{roomId}</code>
+          </div>
+
+          <label style={preJoinLabelStyle}>
+            Ваше имя
+            <input
+              type="text"
+              value={pendingName}
+              onChange={(e) => setPendingName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && pendingName.trim().length > 0) {
+                  e.preventDefault();
+                  handleJoin();
+                }
+              }}
+              placeholder="Как вас представить"
+              autoFocus
+              style={preJoinInputStyle}
+              maxLength={64}
+            />
+          </label>
+
+          <button
+            type="button"
+            disabled={pendingName.trim().length === 0}
+            onClick={handleJoin}
+            style={preJoinBtnStyle}
+          >
+            Присоединиться
+          </button>
+
+          <div style={preJoinModeStyle}>{preJoinModeLabel}</div>
+        </div>
+      </div>
     );
   }
 
