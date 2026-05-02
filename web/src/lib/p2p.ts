@@ -65,6 +65,10 @@ export class P2PMeetConnection {
   // peerId → RTCPeerConnection — для отслеживания connectionstatechange.
   private readonly trackedPCs: Map<string, RTCPeerConnection> = new Map();
 
+  // Локальный camera+mic стрим (передан в start()). Храним чтобы пушить
+  // вновь подключающимся peer'ам в onPeerJoin (Trystero v0.24 не реплеит
+  // ранее добавленные стримы автоматически).
+  private cameraStream: MediaStream | null = null;
   // Локальный screen-share стрим, если активен.
   private screenStream: MediaStream | null = null;
 
@@ -122,19 +126,24 @@ export class P2PMeetConnection {
         }
       });
 
-      // Публикуем локальный stream — Trystero сам сделает addTrack ко всем
-      // активным peer-PC и будет повторять для будущих peer'ов.
+      // Сохраняем локальный stream — onPeerJoin будет пушить его новым
+      // peer'ам. Trystero v0.24 НЕ реплеит ранее добавленные стримы автоматом.
+      this.cameraStream = localStream;
+
+      // Initial publish — для уже-подключённых peer'ов (если room не пуст).
       try {
-        const pubPromises = room.addStream(localStream);
-        // addStream может вернуть массив промисов (по одному на пира). Не ждём,
-        // но логируем ошибки.
-        for (const p of pubPromises) {
-          p.catch((err: unknown) => {
-            this.reportError(err, 'addStream');
-          });
+        const pubResult = room.addStream(localStream);
+        // В разных версиях Trystero addStream возвращает либо void, либо
+        // Promise[]. Защищённо: если итерируется — ловим ошибки.
+        if (pubResult && typeof (pubResult as { length?: number }).length === 'number') {
+          for (const p of pubResult as Promise<unknown>[]) {
+            p?.catch?.((err: unknown) => {
+              this.reportError(err, 'addStream(initial)');
+            });
+          }
         }
       } catch (err) {
-        this.reportError(err, 'addStream');
+        this.reportError(err, 'addStream(initial)');
       }
 
       room.onPeerJoin((peerId) => {
@@ -151,9 +160,25 @@ export class P2PMeetConnection {
               this.reportError(err, 'sendName(onPeerJoin)');
             });
           }
-          // Если у нас уже активен screen-share — пушим его новому пиру.
-          // Trystero сам не реплеит ранее добавленные доп. стримы для новых
-          // подключений, поэтому делаем это вручную.
+          // КРИТИЧНО: пушим основной camera+mic stream новому peer'у.
+          // Trystero v0.24 НЕ реплеит ранее добавленные стримы — без этого
+          // новый peer никогда не увидит наше видео.
+          if (this.cameraStream && this.room) {
+            try {
+              const promises = this.room.addStream(this.cameraStream, peerId);
+              if (promises && typeof (promises as { length?: number }).length === 'number') {
+                for (const p of promises as Promise<unknown>[]) {
+                  p?.catch?.((err: unknown) => {
+                    this.reportError(err, 'addStream(camera,newPeer)');
+                  });
+                }
+              }
+              console.info('[zubrameet/p2p] pushed camera stream to', peerId);
+            } catch (err) {
+              this.reportError(err, 'addStream(camera,newPeer)');
+            }
+          }
+          // Если у нас уже активен screen-share — пушим его новому пиру тоже.
           if (this.screenStream && this.room) {
             try {
               const promises = this.room.addStream(
@@ -161,10 +186,12 @@ export class P2PMeetConnection {
                 peerId,
                 STREAM_META_SCREEN,
               );
-              for (const p of promises) {
-                p.catch((err: unknown) => {
-                  this.reportError(err, 'addStream(screen,newPeer)');
-                });
+              if (promises && typeof (promises as { length?: number }).length === 'number') {
+                for (const p of promises as Promise<unknown>[]) {
+                  p?.catch?.((err: unknown) => {
+                    this.reportError(err, 'addStream(screen,newPeer)');
+                  });
+                }
               }
             } catch (err) {
               this.reportError(err, 'addStream(screen,newPeer)');
@@ -323,6 +350,7 @@ export class P2PMeetConnection {
     const room = this.room;
     this.room = null;
     this.sendName = null;
+    this.cameraStream = null;
     this.peerNames.clear();
     this.peerStreams.clear();
     this.trackedPCs.clear();
