@@ -87,11 +87,12 @@ const darkPng96 = await monochrome(96, WHITE);
 await writeFile(join(publicDir, 'favicon-dark.png'), darkPng96);
 console.log('OK favicon-dark.png');
 
-// favicon.ico — fallback. Берём light (чёрная иконка) — большинство юзеров
-// в ОС светлая тема + .ico всё равно перетирается современным svg на
-// браузерах поддерживающих SVG.
-await writeFile(join(publicDir, 'favicon.ico'), lightPng96);
-console.log('OK favicon.ico (light fallback)');
+// favicon.ico — fallback. У нас target-аудитория и весь UI dark,
+// логично делать его БЕЛЫМ — на dark вкладках Brave/Chrome виден,
+// на light тоже различим (чуть бледный). Когда media-query
+// PNG-link тоже подхватится — он переопределит для light тем.
+await writeFile(join(publicDir, 'favicon.ico'), darkPng96);
+console.log('OK favicon.ico (white default — visible on dark tabs)');
 
 // apple-touch-icon: iOS показывает на home-screen, обычно с цветным фоном
 // (theme_color из manifest = #0a0a0a). Используем БЕЛУЮ иконку.
