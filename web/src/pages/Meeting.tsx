@@ -100,8 +100,23 @@ const headerStyle: CSSProperties = {
 const titleStyle: CSSProperties = {
   margin: 0,
   fontSize: 14,
-  fontWeight: 500,
+  fontWeight: 600,
   color: 'var(--fg)',
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 8,
+};
+
+const brandLogoStyle: CSSProperties = {
+  width: 24,
+  height: 24,
+  flexShrink: 0,
+  display: 'inline-block',
+};
+
+const brandTextStyle: CSSProperties = {
+  fontWeight: 700,
+  letterSpacing: 0.2,
 };
 
 const roomIdStyle: CSSProperties = {
@@ -1797,7 +1812,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       <div style={pageStyle}>
         <div style={headerStyle}>
           <h1 style={titleStyle}>
-            Мит <span style={roomIdStyle}>{roomId}</span>
+            <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" style={brandLogoStyle} />
+            <span style={brandTextStyle}>ZubraMeet</span>
+            <span style={roomIdStyle} title={`ID мита: ${roomId}`}>{roomId}</span>
           </h1>
         </div>
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>

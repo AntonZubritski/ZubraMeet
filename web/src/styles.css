@@ -234,25 +234,26 @@ input:focus, select:focus, textarea:focus {
 [data-tip]::after {
   content: attr(data-tip);
   position: absolute;
-  top: calc(100% + 6px);
+  top: calc(100% + 8px);
   left: 50%;
   transform: translateX(-50%) translateY(-4px);
-  background: rgba(20, 20, 20, 0.96);
+  background: rgba(20, 20, 20, 0.98);
   color: var(--fg);
   border: 1px solid var(--border);
-  padding: 6px 10px;
-  border-radius: 6px;
+  padding: 8px 12px;
+  border-radius: 8px;
   font-size: 12px;
-  line-height: 1.4;
+  font-weight: 400;
+  line-height: 1.45;
   white-space: normal;
   width: max-content;
-  max-width: 280px;
-  text-align: center;
+  max-width: min(360px, calc(100vw - 32px));
+  text-align: left;
   pointer-events: none;
   opacity: 0;
-  transition: opacity 120ms ease, transform 120ms ease;
+  transition: opacity 140ms ease, transform 140ms ease;
   z-index: 1000;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
 }
 [data-tip]:hover::after,
 [data-tip]:focus-visible::after {

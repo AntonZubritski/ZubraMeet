@@ -278,21 +278,21 @@ export default function ChatPanel({ messages, onSend, onClose }: Props) {
   };
 
   // position:relative нужен чтобы абсолютно позиционированный picker
-  // (bottom: calc(100% + 8px), right: 0) встал ОТНОСИТЕЛЬНО footer'а
-  // и оказался прямо над smile-кнопкой.
+  // встал ОТНОСИТЕЛЬНО footer'а и оказался прямо над smile-кнопкой.
+  // alignItems: stretch — чтобы все 3 элемента (smile, textarea, send) имели
+  // одинаковую высоту 38px.
   const footerStyle: CSSProperties = {
     display: 'flex',
-    gap: 8,
+    gap: 6,
     padding: 10,
     borderTop: '1px solid var(--border)',
     flexShrink: 0,
-    alignItems: 'flex-end',
+    alignItems: 'stretch',
     position: 'relative',
   };
 
   const emojiBtnStyle: CSSProperties = {
-    width: 32,
-    height: 32,
+    width: 38,
     flexShrink: 0,
     border: '1px solid var(--border)',
     background: pickerOpen ? 'var(--accent)' : 'var(--bg)',
@@ -310,10 +310,11 @@ export default function ChatPanel({ messages, onSend, onClose }: Props) {
 
   const textareaStyle: CSSProperties = {
     flex: 1,
+    minWidth: 0,
     resize: 'none',
-    minHeight: 36,
+    height: 38,
     maxHeight: 120,
-    padding: '8px 10px',
+    padding: '9px 10px',
     background: 'var(--bg)',
     border: '1px solid var(--border)',
     borderRadius: 8,
@@ -322,10 +323,16 @@ export default function ChatPanel({ messages, onSend, onClose }: Props) {
     lineHeight: 1.4,
     fontFamily: 'inherit',
     outline: 'none',
+    // overflow:hidden скрывает встроенный scrollbar (его native arrows
+    // юзер видел как "▲▼" на скрине). При вырастании выше maxHeight
+    // включится auto.
+    overflow: 'hidden',
+    boxSizing: 'border-box',
   };
 
   const sendBtnStyle: CSSProperties = {
-    padding: '8px 14px',
+    padding: '0 14px',
+    height: 38,
     background: input.trim().length > 0 ? 'var(--accent)' : 'var(--panel)',
     border: '1px solid var(--border)',
     borderColor: input.trim().length > 0 ? 'var(--accent)' : 'var(--border)',
@@ -335,6 +342,8 @@ export default function ChatPanel({ messages, onSend, onClose }: Props) {
     fontWeight: 600,
     cursor: input.trim().length > 0 ? 'pointer' : 'not-allowed',
     transition: 'background-color 120ms ease, color 120ms ease, border-color 120ms ease',
+    flexShrink: 0,
+    whiteSpace: 'nowrap',
   };
 
   return (
@@ -467,7 +476,8 @@ export default function ChatPanel({ messages, onSend, onClose }: Props) {
           value={input}
           onChange={(ev) => setInput(ev.target.value)}
           onKeyDown={handleKey}
-          placeholder="Сообщение… (Enter — отправить, Shift+Enter — новая строка)"
+          placeholder="Сообщение…"
+          title="Enter — отправить, Shift+Enter — новая строка"
           style={textareaStyle}
           rows={1}
           maxLength={2000}
