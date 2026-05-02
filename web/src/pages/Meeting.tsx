@@ -873,8 +873,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
   // Polling /api/relay/status каждые 30с. Гостям сервер отдаст 403 — silently
   // skip. tick-таймер раз в 1с перерисовывает duration/cost-индикатор.
   // Запускаем только после join — до этого relay-индикатор не отрисуется.
+  // В P2P-режиме (serverless / GitHub Pages) бэка нет — пропускаем polling.
   useEffect(() => {
     if (!joined) return;
+    if (resolvedMode !== 'sfu') return;
     let cancelled = false;
     const fetchRelay = (): void => {
       fetch('/api/relay/status')
@@ -905,7 +907,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       window.clearInterval(pollId);
       window.clearInterval(tickId);
     };
-  }, [joined]);
+  }, [joined, resolvedMode]);
 
   const handleStartRelay = (): void => {
     if (relayBusy) return;

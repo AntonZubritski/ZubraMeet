@@ -85,6 +85,7 @@ export class P2PMeetConnection {
   async start(localStream: MediaStream): Promise<void> {
     if (this.started) return;
     this.started = true;
+    console.info('[zubrameet/p2p] start', { roomId: this.roomId, name: this.displayName });
     try {
       try {
         this.events.onLocalStream(localStream);
@@ -100,6 +101,7 @@ export class P2PMeetConnection {
           { appId: APP_ID, rtcConfig: { iceServers: PUBLIC_ICE_SERVERS } },
           this.roomId,
         );
+        console.info('[zubrameet/p2p] joined room via Trystero/Nostr');
       } catch (err) {
         this.reportError(err, 'joinRoom');
         return;
@@ -136,6 +138,7 @@ export class P2PMeetConnection {
       }
 
       room.onPeerJoin((peerId) => {
+        console.info('[zubrameet/p2p] peer joined:', peerId);
         try {
           // Уведомляем сразу с placeholder-именем; настоящее придёт через
           // sendName ниже и перевыпустит onPeerJoined.
@@ -175,6 +178,7 @@ export class P2PMeetConnection {
       });
 
       room.onPeerLeave((peerId) => {
+        console.info('[zubrameet/p2p] peer left:', peerId);
         try {
           this.peerNames.delete(peerId);
           this.peerStreams.delete(peerId);
@@ -186,6 +190,7 @@ export class P2PMeetConnection {
       });
 
       room.onPeerStream((stream, peerId, metadata) => {
+        console.info('[zubrameet/p2p] peer stream:', peerId, 'meta=', metadata);
         try {
           // metadata третьим аргументом приходит из room.addStream(stream, peers, metadata)
           // на отправляющей стороне. Если metadata === 'screen' — это screen-share,
