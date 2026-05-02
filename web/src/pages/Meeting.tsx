@@ -387,7 +387,24 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // Pre-join screen: до setJoined(true) не запускаем getUserMedia/signaling.
   // Это даёт гостю шанс ввести имя и понять, куда он попал, до того как браузер
   // спросит разрешение на камеру.
-  const [joined, setJoined] = useState<boolean>(false);
+  //
+  // Auto-join: если roomId совпадает с sessionStorage 'zubrameet.autojoin'
+  // (хост только что создал мит из Landing) — пропускаем pre-join. Pre-join
+  // нужен только гостю по invite-ссылке.
+  const [joined, setJoined] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      const flag = window.sessionStorage.getItem('zubrameet.autojoin');
+      const hasName = (window.localStorage.getItem(NAME_KEY) ?? '').trim().length > 0;
+      if (flag === roomId && hasName) {
+        window.sessionStorage.removeItem('zubrameet.autojoin');
+        return true;
+      }
+    } catch {
+      /* ignore */
+    }
+    return false;
+  });
   const [pendingName, setPendingName] = useState<string>(() => {
     if (typeof window === 'undefined') return '';
     try {

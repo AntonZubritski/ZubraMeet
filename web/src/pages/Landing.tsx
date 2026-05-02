@@ -240,6 +240,16 @@ export default function Landing() {
   // Трактуем как: блокируем, если хоть одно поле пустое.
   const joinDisabled = trimmedRoom.length === 0 || trimmedName.length === 0;
 
+  // Помечаем roomId как «свежесозданный нами» чтобы Meeting сразу присоединил
+  // без pre-join screen. Pre-join нужен только гостям по invite-ссылке.
+  const markAutoJoin = (id: string): void => {
+    try {
+      window.sessionStorage.setItem('zubrameet.autojoin', id);
+    } catch {
+      /* sessionStorage может быть отключён — не критично */
+    }
+  };
+
   const handleCreate = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
     if (createDisabled) return;
@@ -251,6 +261,7 @@ export default function Landing() {
       if (serverless) {
         const id = generateRoomId();
         const pw = generatePassword();
+        markAutoJoin(id);
         navigate(`/p2p/${id}#${pw}`);
         return;
       }
@@ -264,6 +275,7 @@ export default function Landing() {
         if (resp.status === 405 || resp.status === 404) {
           const id = generateRoomId();
           const pw = generatePassword();
+          markAutoJoin(id);
           navigate(`/p2p/${id}#${pw}`);
           return;
         }
@@ -273,6 +285,7 @@ export default function Landing() {
       if (!data || typeof data.id !== 'string' || data.id.length === 0) {
         throw new Error('Некорректный ответ сервера');
       }
+      markAutoJoin(data.id);
       navigate(`/m/${data.id}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
