@@ -179,9 +179,6 @@ export default function Landing() {
     }
   });
   const [roomId, setRoomId] = useState<string>('');
-  // Опциональный пароль для join: если пользователь вводит roomId руками,
-  // он может также вставить пароль (Crockford base32). Пустой = legacy mode (без E2EE).
-  const [joinPassword, setJoinPassword] = useState<string>('');
   const [creating, setCreating] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string | null>(null);
@@ -226,10 +223,6 @@ export default function Landing() {
 
   const onRoomChange = (e: ChangeEvent<HTMLInputElement>): void => {
     setRoomId(e.target.value.toUpperCase());
-  };
-
-  const onJoinPasswordChange = (e: ChangeEvent<HTMLInputElement>): void => {
-    setJoinPassword(e.target.value.toUpperCase());
   };
 
   const trimmedName = name.trim();
@@ -298,11 +291,9 @@ export default function Landing() {
   const handleJoin = (e: FormEvent): void => {
     e.preventDefault();
     if (joinDisabled) return;
-    const trimmedPw = joinPassword.trim();
-    // Только в P2P-режиме передаём password в URL hash. SFU-режим игнорирует
-    // password (там сигналинг идёт через свой WS-сервер, шифрование не нужно).
-    const target = serverless ? `/p2p/${trimmedRoom}` : `/m/${trimmedRoom}`;
-    navigate(serverless && trimmedPw.length > 0 ? `${target}#${trimmedPw}` : target);
+    // Без password в hash — для зашифрованного мита нужно открывать invite-ссылку
+    // целиком (там пароль в #). Ручной ввод roomId = legacy unencrypted mode.
+    navigate(serverless ? `/p2p/${trimmedRoom}` : `/m/${trimmedRoom}`);
   };
 
   return (
@@ -365,23 +356,6 @@ export default function Landing() {
               maxLength={32}
             />
           </label>
-
-          {serverless !== false && (
-            <label style={labelStyle}>
-              Пароль (если есть)
-              <input
-                type="text"
-                value={joinPassword}
-                onChange={onJoinPasswordChange}
-                placeholder="Из ссылки после #"
-                autoCapitalize="characters"
-                autoCorrect="off"
-                spellCheck={false}
-                style={{ ...inputStyle, textTransform: 'uppercase', letterSpacing: 1 }}
-                maxLength={64}
-              />
-            </label>
-          )}
 
           <button
             type="submit"
