@@ -533,22 +533,26 @@ export class P2PMeetConnection {
       }
     });
 
-    // Поднимаем потолок bitrate для исходящих видео-треков. По умолчанию
-    // браузер таргетит ~500 kbps на video в WebRTC P2P — для 1080p это
-    // мыло. Ставим 2.5 Mbps; реальный битрейт всё равно адаптируется по
-    // bandwidth estimation, но потолок будет 2.5M вместо 500k.
-    void this.boostVideoBitrate(pc, 2_500_000).catch((err: unknown) => {
-      this.reportError(err, 'boostVideoBitrate');
+    // Снимаем дефолтный жёсткий потолок битрейта (~500 kbps в P2P) и
+    // оставляем браузерному WebRTC bandwidth-estimation адаптировать
+    // реальный битрейт по каналу. Жёсткий cap не ставим — пусть на
+    // быстром Ethernet идёт хоть 5 Mbps, на 3G автоматически опустится.
+    void this.tuneVideoEncoding(pc).catch((err: unknown) => {
+      this.reportError(err, 'tuneVideoEncoding');
     });
   }
 
-  // Ставит maxBitrate на все sendonly video-tracks этого RTCPeerConnection.
-  // Безопасно вызывать несколько раз — setParameters идемпотентен.
-  // Пробует несколько раз с интервалом, потому что senders создаются async
-  // после addStream — могут отсутствовать в момент первого вызова.
-  private async boostVideoBitrate(
+  // Настраивает encoding-параметры для всех sendonly video-треков этого PC:
+  //  - снимает дефолтный maxBitrate (≈500 kbps)
+  //  - degradationPreference 'balanced' — при перегрузке сети браузер
+  //    балансированно роняет и framerate, и resolution (вместо того чтобы
+  //    держать разрешение и фризить)
+  //  - networkPriority 'high' — приоритет видео-пакетов над data-channel
+  // Безопасно вызывать многократно (setParameters идемпотентен).
+  // Ретраит до 5 раз с интервалом 500ms, потому что senders создаются
+  // асинхронно после addStream.
+  private async tuneVideoEncoding(
     pc: RTCPeerConnection,
-    maxBps: number,
     attempt = 0,
   ): Promise<void> {
     let videoSenders = 0;
@@ -556,23 +560,33 @@ export class P2PMeetConnection {
       if (!sender.track || sender.track.kind !== 'video') continue;
       videoSenders++;
       const params = sender.getParameters();
-      if (!params.encodings) params.encodings = [{}];
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
       let changed = false;
       for (const e of params.encodings) {
-        if (e.maxBitrate !== maxBps) {
-          e.maxBitrate = maxBps;
+        // Снимаем cap — пусть adaptive bandwidth estimation решает.
+        if (e.maxBitrate !== undefined) {
+          delete e.maxBitrate;
           changed = true;
         }
+        if (e.networkPriority !== 'high') {
+          e.networkPriority = 'high';
+          changed = true;
+        }
+      }
+      // degradationPreference — на уровне всего sender, не encoding.
+      if (params.degradationPreference !== 'balanced') {
+        params.degradationPreference = 'balanced';
+        changed = true;
       }
       if (changed) {
         await sender.setParameters(params);
       }
     }
-    // Если ещё нет видео-senders — ретраим до 5 раз с интервалом 500ms.
-    // Покрывает случай когда initial addStream ещё не завершился.
     if (videoSenders === 0 && attempt < 5 && !this.closed) {
       window.setTimeout(() => {
-        void this.boostVideoBitrate(pc, maxBps, attempt + 1);
+        void this.tuneVideoEncoding(pc, attempt + 1);
       }, 500);
     }
   }
