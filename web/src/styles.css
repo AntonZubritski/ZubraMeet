@@ -14,11 +14,27 @@
 
 html, body, #root {
   margin: 0;
-  height: 100%;
+  /* Fallback для очень старых браузеров — фиксированный viewport. */
+  height: 100vh;
+  /* Современный dynamic viewport: учитывает динамическую часть UI браузера
+     (адресная строка iOS Safari, Brave Mobile, top toolbar Android Chrome).
+     Когда панели скрываются при скролле, dvh растёт; когда появляются —
+     уменьшается. Это убирает лишний "прыгающий" scroll на странице. */
+  height: 100dvh;
+  /* На мобильных без overflow:hidden браузер всё равно показывает основной
+     scrollbar страницы из-за округлений / safe-area / клавиатуры. */
+  overflow: hidden;
   background: var(--bg);
   color: var(--fg);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 14px;
+}
+
+/* Safe-area для iOS notch/home-indicator. Применяется на body, чтобы внутри
+   #root наш layout уже жил в "безопасной" области и фиксированный Controls
+   (position: fixed, bottom: 16) не залезал под home-indicator. */
+body {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
 /* Share-panel: список URL для приглашения гостей (хост-only). */

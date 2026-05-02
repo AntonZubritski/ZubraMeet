@@ -25,13 +25,20 @@ interface Props {
   onChangeScreenQuality(q: ScreenQuality): void;
   onLeave(): void;
   onCopyInvite(): void;
+  // Auto-hide chrome: когда true — bar уезжает вниз (translateY(100%)),
+  // opacity 0, pointer-events: none. Любой tap/mousemove на странице снова
+  // покажет (логика в Meeting.tsx через idle-timer). Optional, default = false.
+  hidden?: boolean;
 }
 
 const ICON_SIZE = 20;
 
 const barStyle: CSSProperties = {
   position: 'fixed',
-  bottom: 16,
+  // Учитываем safe-area-inset-bottom (iOS home-indicator) — фиксированный bar
+  // не должен залезать под индикатор. На устройствах без safe-area env() = 0,
+  // и bottom = 16px как раньше.
+  bottom: 'calc(16px + env(safe-area-inset-bottom))',
   left: '50%',
   transform: 'translateX(-50%)',
   display: 'flex',
@@ -43,6 +50,20 @@ const barStyle: CSSProperties = {
   border: '1px solid var(--border)',
   borderRadius: 999,
   zIndex: 100,
+  transition: 'transform 250ms ease, opacity 250ms ease',
+  opacity: 1,
+};
+
+// Стиль когда bar скрыт (idle 5с): уезжает вниз за пределы viewport
+// и игнорирует pointer events (тап показывает chrome через listener
+// в Meeting.tsx, но НЕ нажимает кнопку случайно).
+const barHiddenStyle: CSSProperties = {
+  // Сохраняем translateX(-50%) для горизонтального центрирования и
+  // добавляем translateY(calc(100% + ...)) чтобы bar полностью ушёл вниз
+  // вместе с safe-area отступом.
+  transform: 'translateX(-50%) translateY(calc(100% + 32px))',
+  opacity: 0,
+  pointerEvents: 'none',
 };
 
 type Variant = 'default' | 'off' | 'leave' | 'active';
@@ -546,9 +567,11 @@ export default function Controls({
   onChangeScreenQuality,
   onLeave,
   onCopyInvite,
+  hidden = false,
 }: Props) {
+  const style: CSSProperties = hidden ? { ...barStyle, ...barHiddenStyle } : barStyle;
   return (
-    <div style={barStyle} role="toolbar" aria-label="Управление звонком">
+    <div style={style} role="toolbar" aria-label="Управление звонком" aria-hidden={hidden}>
       <CircleButton
         variant={micOn ? 'default' : 'off'}
         onClick={onToggleMic}

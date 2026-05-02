@@ -487,6 +487,14 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // mirror-loop detection). Очищается через таймер.
   const [screenShareError, setScreenShareError] = useState<string | null>(null);
 
+  // Auto-hide chrome (header + Controls) после 5с бездействия. Любая активность
+  // (mousemove, mousedown, touchstart, keydown, wheel) сбрасывает таймер и
+  // показывает chrome. В скрытом состоянии bar/header получают pointer-events:
+  // none — первый тап показывает chrome (через listener), второй уже работает
+  // как обычно. См. useEffect ниже.
+  const [chromeVisible, setChromeVisible] = useState<boolean>(true);
+  const idleTimerRef = useRef<number | null>(null);
+
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
   const sfuConnectionRef = useRef<MeetConnection | null>(null);
@@ -527,6 +535,55 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       cancelled = true;
     };
   }, [modeProp, resolvedMode]);
+
+  // Auto-hide chrome (header + Controls) после 5 секунд бездействия. Запускаем
+  // только когда joined === true — в pre-join screen чрома и нет, и его layout
+  // совсем другой. Любая активность (mousemove/mousedown/touchstart/keydown/
+  // wheel) сбрасывает таймер и показывает chrome. На unmount/leave убираем
+  // listeners и таймер.
+  useEffect(() => {
+    if (!joined) {
+      // На pre-join всегда показываем chrome (если вернёмся в joined-state,
+      // эффект перезапустится и снова поставит таймер).
+      setChromeVisible(true);
+      return;
+    }
+
+    const HIDE_AFTER_MS = 5000;
+
+    const arm = (): void => {
+      setChromeVisible(true);
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
+      }
+      idleTimerRef.current = window.setTimeout(() => {
+        setChromeVisible(false);
+      }, HIDE_AFTER_MS);
+    };
+
+    arm();
+
+    const events: (keyof DocumentEventMap)[] = [
+      'mousemove',
+      'mousedown',
+      'touchstart',
+      'keydown',
+      'wheel',
+    ];
+    for (const ev of events) {
+      window.addEventListener(ev, arm, { passive: true });
+    }
+
+    return () => {
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = null;
+      }
+      for (const ev of events) {
+        window.removeEventListener(ev, arm);
+      }
+    };
+  }, [joined]);
 
   // Recover camera/microphone после sleep/wake.
   // Останавливаем старые треки, getUserMedia заново, replaceLocalTracks на publishPC.
@@ -1676,9 +1733,35 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       ? 'P2P: видео идёт напрямую между всеми (mesh через Nostr-сигналинг). Хорошо для маленьких комнат и хостов за CGNAT. Если за symmetric NAT — fallback через бесплатный публичный TURN (OpenRelay).'
       : 'SFU: видео идёт через хоста-сервер. Лучше масштабируется на много участников.';
 
+  // Динамические стили для auto-hide:
+  // - header едет вверх (translateY(-100%)), opacity 0, pointer-events: none.
+  // - gridContainer в скрытом состоянии расширяется на всю высоту (paddingBottom: 0),
+  //   потому что Controls тоже уехал вниз.
+  const headerDynamicStyle: CSSProperties = chromeVisible
+    ? {
+        ...headerStyle,
+        transform: 'translateY(0)',
+        opacity: 1,
+        transition: 'transform 250ms ease, opacity 250ms ease',
+      }
+    : {
+        ...headerStyle,
+        transform: 'translateY(-100%)',
+        opacity: 0,
+        pointerEvents: 'none',
+        transition: 'transform 250ms ease, opacity 250ms ease',
+      };
+  const gridContainerDynamicStyle: CSSProperties = chromeVisible
+    ? gridContainerStyle
+    : {
+        ...gridContainerStyle,
+        paddingBottom: 0,
+        transition: 'padding-bottom 250ms ease',
+      };
+
   return (
     <div style={pageStyle}>
-      <div style={headerStyle}>
+      <div style={headerDynamicStyle}>
         <h1 style={titleStyle}>
           Мит <span style={roomIdStyle}>{roomId}</span>
         </h1>
@@ -1973,7 +2056,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         </div>
       )}
 
-      <div style={gridContainerStyle}>
+      <div style={gridContainerDynamicStyle}>
         <VideoGrid tiles={tiles} />
       </div>
 
@@ -1988,6 +2071,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         onChangeScreenQuality={setScreenQuality}
         onLeave={handleLeave}
         onCopyInvite={handleCopyInvite}
+        hidden={!chromeVisible}
       />
 
       {reconnecting && (
