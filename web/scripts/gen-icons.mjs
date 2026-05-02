@@ -36,28 +36,43 @@ const sourceSvg = await readFile(sourceSvgPath);
 //
 // monochrome = 1 (белый) или 0 (чёрный) или конкретный цвет.
 async function monochrome(size, color) {
-  // Рендерим SVG в raster нужного размера.
-  const png = await sharp(sourceSvg, { density: 600 })
+  // 1. Рендерим SVG в RGBA-raster нужного размера (alpha уже там — фон
+  //    исходника прозрачный, см. метаданные ZuTeem source).
+  const rendered = await sharp(sourceSvg, { density: 600 })
     .resize(size, size, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .ensureAlpha()
     .png()
     .toBuffer();
 
-  // Извлекаем alpha-канал (форма иконки).
-  const alpha = await sharp(png).extractChannel('alpha').toBuffer();
-  const meta = await sharp(png).metadata();
+  // 2. Извлекаем alpha как 1-канальное grayscale изображение (raw),
+  //    которое потом приложим к solid-color rectangle через dest-in.
+  const alphaRaw = await sharp(rendered)
+    .extractChannel('alpha')
+    .toColourspace('b-w')
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-  // Создаём solid-цветный прямоугольник нужного размера + alpha из иконки.
-  return sharp({
+  // 3. Создаём solid-RGB прямоугольник (без alpha-канала).
+  //    joinChannel добавит наш alpha-канал → получится RGBA силуэт.
+  const tinted = await sharp({
     create: {
-      width: meta.width,
-      height: meta.height,
-      channels: 4,
-      background: { r: color.r, g: color.g, b: color.b, alpha: 1 },
+      width: size,
+      height: size,
+      channels: 3,
+      background: { r: color.r, g: color.g, b: color.b },
     },
   })
-    .joinChannel(alpha)
+    .joinChannel(alphaRaw.data, {
+      raw: {
+        width: alphaRaw.info.width,
+        height: alphaRaw.info.height,
+        channels: 1,
+      },
+    })
     .png()
     .toBuffer();
+
+  return tinted;
 }
 
 const BLACK = { r: 0, g: 0, b: 0 };
