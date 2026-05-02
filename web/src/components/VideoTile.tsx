@@ -30,9 +30,13 @@ const tileStyle: CSSProperties = {
   justifyContent: 'center',
 };
 
+// Placeholder с аватаром накладывается ПОВЕРХ <video> когда камера выключена.
+// position: absolute — чтобы video не размонтировался: srcObject остаётся
+// прикреплённым, и при возврате камеры мы НЕ потеряем поток (известный баг
+// React conditional rendering + srcObject).
 const placeholderStyle: CSSProperties = {
-  width: '100%',
-  height: '100%',
+  position: 'absolute',
+  inset: 0,
   display: 'flex',
   flexDirection: 'column',
   alignItems: 'center',
@@ -290,7 +294,17 @@ export default function VideoTile({
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
-      {camMuted ? (
+      {/* Видео ВСЕГДА в DOM с прикреплённым srcObject. При камере off мы
+          просто накладываем placeholder сверху — video продолжает жить и
+          мгновенно появляется при включении (без re-attach stream). */}
+      <video
+        ref={videoRef}
+        style={videoStyle}
+        autoPlay
+        playsInline
+        muted={isLocal || micMuted}
+      />
+      {camMuted && (
         <div style={placeholderStyle} aria-label={`Камера выключена: ${name}`}>
           <div style={placeholderAvatarWrapStyle}>
             <Avatar
@@ -304,14 +318,6 @@ export default function VideoTile({
             {displayName}
           </div>
         </div>
-      ) : (
-        <video
-          ref={videoRef}
-          style={videoStyle}
-          autoPlay
-          playsInline
-          muted={isLocal || micMuted}
-        />
       )}
 
       <div style={nameOverlayStyle} title={name}>

@@ -47,6 +47,11 @@ interface Props {
 interface PeerEntry {
   stream: MediaStream;
   name: string;
+  // Видео-track выключен (track.muted = true). Камера на стороне peer'а off,
+  // либо track ещё не пошёл. Используется для рендера placeholder с аватаром.
+  camMuted?: boolean;
+  // Аналогично для аудио (на будущее — пока в UI не используется).
+  micMuted?: boolean;
 }
 
 // Удалённый screen-share от пира. Ключ — `${peerId}:${stream.id}` (на случай
@@ -795,9 +800,30 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
           return;
         }
         // camera (default)
+        // Подписываемся на mute/unmute видео-track'а удалённого peer'а —
+        // браузер выставляет track.muted = true когда удалённая сторона
+        // отключила свой track (track.enabled=false на их стороне или
+        // выключение камеры). Без этого у нас был чёрный экран без аватара.
+        const updateCamMuted = (muted: boolean): void => {
+          setPeers((prev) => {
+            const cur = prev.get(peerId);
+            if (!cur) return prev;
+            if ((cur.camMuted ?? false) === muted) return prev;
+            const next = new Map(prev);
+            next.set(peerId, { ...cur, camMuted: muted });
+            return next;
+          });
+        };
+        const videoTracks = remoteStream.getVideoTracks();
+        const initialCamMuted =
+          videoTracks.length === 0 || videoTracks.every((t) => t.muted);
+        for (const t of videoTracks) {
+          t.addEventListener('mute', () => updateCamMuted(true));
+          t.addEventListener('unmute', () => updateCamMuted(false));
+        }
         setPeers((prev) => {
           const next = new Map(prev);
-          next.set(peerId, { stream: remoteStream, name });
+          next.set(peerId, { stream: remoteStream, name, camMuted: initialCamMuted });
           return next;
         });
       },
@@ -1418,6 +1444,8 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       id: pid,
       stream: entry.stream,
       name: entry.name && entry.name.length > 0 ? entry.name : 'Участник',
+      camMuted: entry.camMuted,
+      micMuted: entry.micMuted,
     });
   }
 
