@@ -4,8 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#0a0a0a" />
+    <!-- PNG-favicons адаптивные через media-query.
+         SVG-link НЕ добавляем — Chrome/Brave кешируют первый рендер SVG
+         и не пересчитывают на смену темы (CSS @media внутри SVG-favicon
+         фактически не работает). На PNG это работает железно.
+         favicon.ico — fallback для очень старых браузеров. -->
     <link rel="icon" href="%BASE_URL%favicon.ico" sizes="any" />
-    <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <link rel="icon" type="image/png" sizes="96x96" href="%BASE_URL%favicon-light.png" media="(prefers-color-scheme: light)" />
     <link rel="icon" type="image/png" sizes="96x96" href="%BASE_URL%favicon-dark.png" media="(prefers-color-scheme: dark)" />
     <link rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon.png" />

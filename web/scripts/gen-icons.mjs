@@ -91,10 +91,15 @@ for (const size of [192, 512]) {
   console.log(`OK web-app-manifest-${size}x${size}.png`);
 }
 
-// favicon.svg — adaptive через @media prefers-color-scheme.
-// Берём исходный raster через extract base64 PNG чтобы можно было
-// раскрасить через CSS-fill (но raster не имеет fill-атрибута, поэтому
-// используем mask: flood-цвет с alpha-маской из иконки).
+// favicon.svg — БЕЛЫЙ по умолчанию.
+//
+// Почему не adaptive внутри SVG: Brave/Chrome кешируют первый рендер SVG
+// favicon и не применяют CSS @media prefers-color-scheme при смене темы.
+// На dark вкладках Brave наш чёрный SVG выглядел тёмно-серым.
+//
+// Делаем железно: SVG = белый (хорошо виден на dark вкладках). На light
+// темах браузер подхватит favicon-light.png через media-query в <link>
+// (см. index.html).
 const inner = sourceSvg.toString();
 const m = inner.match(/(data:image\/png;base64,[A-Za-z0-9+/=]+)/);
 if (!m) {
@@ -102,18 +107,14 @@ if (!m) {
 }
 const dataUri = m[1];
 
-const adaptiveSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 483 483">
+const whiteSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 483 483">
   <defs>
     <mask id="silhouette" maskContentUnits="userSpaceOnUse" maskUnits="userSpaceOnUse">
       <image x="0" y="0" width="483" height="483" href="${dataUri}"/>
     </mask>
   </defs>
-  <style>
-    .icon { fill: #0a0a0a; }
-    @media (prefers-color-scheme: dark) { .icon { fill: #ffffff; } }
-  </style>
-  <rect class="icon" width="483" height="483" mask="url(#silhouette)"/>
+  <rect width="483" height="483" fill="#ffffff" mask="url(#silhouette)"/>
 </svg>
 `;
-await writeFile(join(publicDir, 'favicon.svg'), adaptiveSvg);
-console.log('OK favicon.svg (adaptive)');
+await writeFile(join(publicDir, 'favicon.svg'), whiteSvg);
+console.log('OK favicon.svg (white default)');
