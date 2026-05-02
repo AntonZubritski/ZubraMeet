@@ -566,10 +566,17 @@ export default function VideoTile({
   };
 
   // Показываем "большую" overlay-кнопку только на REMOTE screen-tile'ах
-  // (не на нашем собственном — у себя fullscreen скроет лишь наше же видео).
+  // (не на нашем собственном — у себя fullscreen скроет лишь наше же видео)
   // И только пока тайл не в fullscreen.
+  // ТАКЖЕ: только на touch-устройствах (мобильные/планшеты, hover: none).
+  // На десктопе hover-кнопки в углу хватает, центральный overlay только
+  // загораживает контент.
+  const isTouch =
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(hover: none)').matches;
   const showFullscreenOverlay =
-    isScreen && !isLocalScreen && !isFullscreen;
+    isScreen && !isLocalScreen && !isFullscreen && isTouch;
 
   // Talking visualization — концентрические круги расходящиеся от аватара,
   // как круги на воде. Реализовано через 3 absolute div'а с CSS animation;
