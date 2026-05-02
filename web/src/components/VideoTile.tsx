@@ -28,9 +28,6 @@ const tileStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
-  // Плавный переход свечения при изменении volumeLevel — без него ring
-  // дёргался бы пиксель-в-пиксель на каждый rAF (некрасиво и заметно глазу).
-  transition: 'box-shadow 80ms linear',
 };
 
 // Порог "говорит/не говорит" — среднее frequency-bin значение (0-255).
@@ -57,11 +54,37 @@ const placeholderStyle: CSSProperties = {
 };
 
 const placeholderAvatarWrapStyle: CSSProperties = {
+  position: 'relative',
   width: 'clamp(80px, 18vh, 160px)',
   height: 'clamp(80px, 18vh, 160px)',
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+};
+
+// Talking ripples — 3 концентрических круга расходятся от аватара (CSS keyframe
+// `zubrameet-ripple` объявлен в styles.css). Прячутся под аватар через z-index.
+// Sizing — 100% от wrap'а; круги стартуют как точка-аватар, разрастаются ×2.4
+// и тускнеют. Animation play-state регулируется speaking прямо в style props.
+const rippleBaseStyle: CSSProperties = {
+  position: 'absolute',
+  inset: 0,
+  borderRadius: '50%',
+  border: '2px solid #22c55e',
+  pointerEvents: 'none',
+  willChange: 'transform, opacity',
+  animation: 'zubrameet-ripple 1.6s ease-out infinite',
+};
+
+// Маленький wrap для name-overlay аватара — тоже ripples, только малые.
+const nameOverlayAvatarRippleStyle: CSSProperties = {
+  position: 'absolute',
+  inset: 0,
+  borderRadius: '50%',
+  border: '1.5px solid #22c55e',
+  pointerEvents: 'none',
+  willChange: 'transform, opacity',
+  animation: 'zubrameet-ripple 1.4s ease-out infinite',
 };
 
 const placeholderNameStyle: CSSProperties = {
@@ -389,25 +412,15 @@ export default function VideoTile({
     pointerEvents: hovered || isFullscreen ? 'auto' : 'none',
   };
 
-  // Speaking ring — зелёный (accent #22c55e) glow вокруг всего тайла,
-  // расширяется пропорционально volumeLevel (0..100). При тишине — 0px.
-  // Используем два слоя box-shadow: внешний (большой, мягкий) + внутренний
-  // (тонкая чёткая обводка), чтобы и было видно на тёмном фоне, и не
-  // выглядело размыто.
+  // Talking visualization — концентрические круги расходящиеся от аватара,
+  // как круги на воде. Реализовано через 3 absolute div'а с CSS animation;
+  // play-state ставим в paused когда volumeLevel === 0 (тишина).
   const speaking = volumeLevel > 0;
-  const ringSize = speaking ? 4 + volumeLevel / 8 : 0; // 0..16.5px
-  const ringAlpha = speaking ? 0.3 + volumeLevel / 250 : 0; // 0.3..0.7
-  const tileDynamicStyle: CSSProperties = {
-    ...tileStyle,
-    boxShadow: speaking
-      ? `0 0 0 2px rgba(34, 197, 94, ${ringAlpha + 0.2}), 0 0 ${ringSize * 2}px ${ringSize}px rgba(34, 197, 94, ${ringAlpha})`
-      : 'none',
-  };
 
   return (
     <div
       ref={containerRef}
-      style={tileDynamicStyle}
+      style={tileStyle}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
@@ -424,6 +437,13 @@ export default function VideoTile({
       {camMuted && (
         <div style={placeholderStyle} aria-label={`Камера выключена: ${name}`}>
           <div style={placeholderAvatarWrapStyle}>
+            {speaking && (
+              <>
+                <span style={{ ...rippleBaseStyle, animationDelay: '0s' }} aria-hidden="true" />
+                <span style={{ ...rippleBaseStyle, animationDelay: '0.5s' }} aria-hidden="true" />
+                <span style={{ ...rippleBaseStyle, animationDelay: '1.0s' }} aria-hidden="true" />
+              </>
+            )}
             <Avatar
               size="100%"
               name={name || '?'}
@@ -439,6 +459,12 @@ export default function VideoTile({
 
       <div style={nameOverlayStyle} title={name}>
         <span style={nameOverlayAvatarStyle} aria-hidden="true">
+          {speaking && (
+            <>
+              <span style={{ ...nameOverlayAvatarRippleStyle, animationDelay: '0s' }} />
+              <span style={{ ...nameOverlayAvatarRippleStyle, animationDelay: '0.45s' }} />
+            </>
+          )}
           <Avatar size={18} name={name || '?'} variant="beam" colors={AVATAR_COLORS} />
         </span>
         <span>{displayName}</span>
