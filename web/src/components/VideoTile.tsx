@@ -454,7 +454,37 @@ export default function VideoTile({
   const handleToggleFullscreen = (e: React.MouseEvent): void => {
     e.stopPropagation();
     const el = containerRef.current;
+    const video = videoRef.current;
     if (!el) return;
+
+    // iOS Safari НЕ поддерживает Element.requestFullscreen — это ограничение
+    // Apple. Только <video> может уйти в нативный плеер через
+    // webkitEnterFullscreen. Поэтому на iOS-like browsers идём через video.
+    type IOSVideo = HTMLVideoElement & {
+      webkitEnterFullscreen?(): void;
+      webkitDisplayingFullscreen?: boolean;
+    };
+    const iosVideo = video as IOSVideo | null;
+    const standardSupported =
+      typeof el.requestFullscreen === 'function' &&
+      typeof document.exitFullscreen === 'function';
+    const iosFullscreenSupported =
+      !standardSupported && !!iosVideo && typeof iosVideo.webkitEnterFullscreen === 'function';
+
+    if (iosFullscreenSupported && iosVideo && iosVideo.webkitEnterFullscreen) {
+      try {
+        iosVideo.webkitEnterFullscreen();
+      } catch (err) {
+        console.error('[VideoTile] webkitEnterFullscreen failed', err);
+      }
+      return;
+    }
+
+    if (!standardSupported) {
+      console.warn('[VideoTile] fullscreen not supported in this browser');
+      return;
+    }
+
     if (document.fullscreenElement === el) {
       // Уже мы в fullscreen — выходим.
       void document.exitFullscreen().catch((err: unknown) => {
