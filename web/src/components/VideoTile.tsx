@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import Avatar from 'boring-avatars';
+
+// Палитра под dark-тему (зелёный/бирюзовый/янтарь/розовый/индиго).
+const AVATAR_COLORS = ['#22c55e', '#06b6d4', '#fbbf24', '#ec4899', '#6366f1'];
 
 interface Props {
   stream: MediaStream;
@@ -39,11 +43,12 @@ const placeholderStyle: CSSProperties = {
   userSelect: 'none',
 };
 
-const placeholderInitialStyle: CSSProperties = {
-  fontSize: 'clamp(32px, 6vw, 72px)',
-  fontWeight: 600,
-  textTransform: 'uppercase',
-  lineHeight: 1,
+const placeholderAvatarWrapStyle: CSSProperties = {
+  width: 'clamp(80px, 18vh, 160px)',
+  height: 'clamp(80px, 18vh, 160px)',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
 };
 
 const placeholderNameStyle: CSSProperties = {
@@ -61,9 +66,9 @@ const nameOverlayStyle: CSSProperties = {
   position: 'absolute',
   left: 8,
   bottom: 8,
-  padding: '4px 8px',
+  padding: '3px 8px 3px 3px',
   background: 'rgba(0, 0, 0, 0.55)',
-  borderRadius: 4,
+  borderRadius: 999,
   color: 'var(--fg)',
   fontSize: 12,
   lineHeight: 1,
@@ -72,6 +77,20 @@ const nameOverlayStyle: CSSProperties = {
   textOverflow: 'ellipsis',
   whiteSpace: 'nowrap',
   pointerEvents: 'none',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+};
+
+const nameOverlayAvatarStyle: CSSProperties = {
+  width: 18,
+  height: 18,
+  flexShrink: 0,
+  borderRadius: '50%',
+  overflow: 'hidden',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
 };
 
 // mic-off перенесли в верхний-левый, чтобы не перекрывать кнопку fullscreen справа.
@@ -107,15 +126,6 @@ const fullscreenBtnBaseStyle: CSSProperties = {
   padding: 0,
   transition: 'opacity 120ms ease',
 };
-
-function getInitial(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) return '?';
-  // Берём первый кодпоинт, чтобы корректно работать с эмодзи и не-ASCII.
-  const iter = trimmed[Symbol.iterator]();
-  const first = iter.next().value as string | undefined;
-  return (first ?? '?').toUpperCase();
-}
 
 function MicOffIcon() {
   return (
@@ -282,7 +292,14 @@ export default function VideoTile({
     >
       {camMuted ? (
         <div style={placeholderStyle} aria-label={`Камера выключена: ${name}`}>
-          <div style={placeholderInitialStyle}>{getInitial(name)}</div>
+          <div style={placeholderAvatarWrapStyle}>
+            <Avatar
+              size="100%"
+              name={name || '?'}
+              variant="beam"
+              colors={AVATAR_COLORS}
+            />
+          </div>
           <div style={placeholderNameStyle} title={name}>
             {displayName}
           </div>
@@ -298,7 +315,10 @@ export default function VideoTile({
       )}
 
       <div style={nameOverlayStyle} title={name}>
-        {displayName}
+        <span style={nameOverlayAvatarStyle} aria-hidden="true">
+          <Avatar size={18} name={name || '?'} variant="beam" colors={AVATAR_COLORS} />
+        </span>
+        <span>{displayName}</span>
       </div>
 
       {micMuted && (
