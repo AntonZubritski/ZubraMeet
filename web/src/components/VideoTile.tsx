@@ -1,4 +1,4 @@
-import { useEffect, useRef, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 
 interface Props {
   stream: MediaStream;
@@ -6,12 +6,17 @@ interface Props {
   isLocal?: boolean;
   micMuted?: boolean;
   camMuted?: boolean;
+  // НОВОЕ — рендерим как screen-share (объект другой aspect, в layout другая зона).
+  // Сам тайл этот флаг почти не использует (визуально не отличается), но
+  // для screen-share нужно objectFit: contain (а не cover) и подпись.
+  isScreen?: boolean;
+  isLocalScreen?: boolean;
 }
 
 const tileStyle: CSSProperties = {
   position: 'relative',
   width: '100%',
-  aspectRatio: '16 / 9',
+  height: '100%',
   background: '#000',
   border: '1px solid var(--border)',
   borderRadius: 8,
@@ -21,26 +26,35 @@ const tileStyle: CSSProperties = {
   justifyContent: 'center',
 };
 
-const videoStyle: CSSProperties = {
-  width: '100%',
-  height: '100%',
-  objectFit: 'cover',
-  display: 'block',
-  background: '#000',
-};
-
 const placeholderStyle: CSSProperties = {
   width: '100%',
   height: '100%',
   display: 'flex',
+  flexDirection: 'column',
   alignItems: 'center',
   justifyContent: 'center',
+  gap: 8,
   background: 'var(--panel)',
   color: 'var(--fg)',
+  userSelect: 'none',
+};
+
+const placeholderInitialStyle: CSSProperties = {
   fontSize: 'clamp(32px, 6vw, 72px)',
   fontWeight: 600,
   textTransform: 'uppercase',
-  userSelect: 'none',
+  lineHeight: 1,
+};
+
+const placeholderNameStyle: CSSProperties = {
+  fontSize: 'clamp(13px, 1.4vw, 16px)',
+  fontWeight: 500,
+  color: 'var(--muted)',
+  maxWidth: '90%',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  textAlign: 'center',
 };
 
 const nameOverlayStyle: CSSProperties = {
@@ -60,10 +74,11 @@ const nameOverlayStyle: CSSProperties = {
   pointerEvents: 'none',
 };
 
+// mic-off перенесли в верхний-левый, чтобы не перекрывать кнопку fullscreen справа.
 const micOffStyle: CSSProperties = {
   position: 'absolute',
   top: 8,
-  right: 8,
+  left: 8,
   width: 24,
   height: 24,
   display: 'flex',
@@ -72,6 +87,25 @@ const micOffStyle: CSSProperties = {
   background: 'rgba(0, 0, 0, 0.55)',
   borderRadius: '50%',
   color: 'var(--danger)',
+  pointerEvents: 'none',
+};
+
+const fullscreenBtnBaseStyle: CSSProperties = {
+  position: 'absolute',
+  top: 8,
+  right: 8,
+  width: 28,
+  height: 28,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background: 'rgba(0, 0, 0, 0.55)',
+  border: 'none',
+  borderRadius: 6,
+  color: 'var(--fg)',
+  cursor: 'pointer',
+  padding: 0,
+  transition: 'opacity 120ms ease',
 };
 
 function getInitial(name: string): string {
@@ -107,14 +141,63 @@ function MicOffIcon() {
   );
 }
 
+// 4 уголка наружу — «развернуть».
+function FullscreenEnterIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="4 9 4 4 9 4" />
+      <polyline points="20 9 20 4 15 4" />
+      <polyline points="4 15 4 20 9 20" />
+      <polyline points="20 15 20 20 15 20" />
+    </svg>
+  );
+}
+
+// 4 уголка внутрь — «свернуть».
+function FullscreenExitIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="9 4 9 9 4 9" />
+      <polyline points="15 4 15 9 20 9" />
+      <polyline points="9 20 9 15 4 15" />
+      <polyline points="15 20 15 15 20 15" />
+    </svg>
+  );
+}
+
 export default function VideoTile({
   stream,
   name,
   isLocal = false,
   micMuted = false,
   camMuted = false,
+  isScreen = false,
+  isLocalScreen = false,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [hovered, setHovered] = useState<boolean>(false);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -124,11 +207,85 @@ export default function VideoTile({
     }
   }, [stream]);
 
+  // Слушаем глобальный fullscreenchange — пользователь может выйти из
+  // полноэкранного режима через Esc, тогда контейнер перестаёт быть fullscreen,
+  // и мы должны переключить иконку обратно на «развернуть».
+  useEffect(() => {
+    const onChange = (): void => {
+      const el = containerRef.current;
+      if (!el) {
+        setIsFullscreen(false);
+        return;
+      }
+      setIsFullscreen(document.fullscreenElement === el);
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+    };
+  }, []);
+
+  const handleToggleFullscreen = (e: React.MouseEvent): void => {
+    e.stopPropagation();
+    const el = containerRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      // Уже мы в fullscreen — выходим.
+      void document.exitFullscreen().catch((err: unknown) => {
+        console.error('[VideoTile] exitFullscreen failed', err);
+      });
+      return;
+    }
+    if (document.fullscreenElement) {
+      // В fullscreen другой элемент — сначала выходим из него, потом входим.
+      void document
+        .exitFullscreen()
+        .then(() => el.requestFullscreen())
+        .catch((err: unknown) => {
+          console.error('[VideoTile] requestFullscreen failed', err);
+        });
+      return;
+    }
+    void el.requestFullscreen().catch((err: unknown) => {
+      console.error('[VideoTile] requestFullscreen failed', err);
+    });
+  };
+
+  // Для screen-share не обрезаем (objectFit: contain), для камеры — cover.
+  const videoStyle: CSSProperties = {
+    width: '100%',
+    height: '100%',
+    objectFit: isScreen ? 'contain' : 'cover',
+    display: 'block',
+    background: '#000',
+  };
+
+  // Для local-screen приписываем «(ваш экран)», для остальных стандарт.
+  const displayName = isLocalScreen
+    ? `${name} (ваш экран)`
+    : isLocal
+      ? `${name} (вы)`
+      : name;
+
+  const fullscreenBtnStyle: CSSProperties = {
+    ...fullscreenBtnBaseStyle,
+    opacity: hovered || isFullscreen ? 1 : 0,
+    pointerEvents: hovered || isFullscreen ? 'auto' : 'none',
+  };
+
   return (
-    <div style={tileStyle}>
+    <div
+      ref={containerRef}
+      style={tileStyle}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
       {camMuted ? (
         <div style={placeholderStyle} aria-label={`Камера выключена: ${name}`}>
-          {getInitial(name)}
+          <div style={placeholderInitialStyle}>{getInitial(name)}</div>
+          <div style={placeholderNameStyle} title={name}>
+            {displayName}
+          </div>
         </div>
       ) : (
         <video
@@ -141,8 +298,7 @@ export default function VideoTile({
       )}
 
       <div style={nameOverlayStyle} title={name}>
-        {name}
-        {isLocal ? ' (вы)' : ''}
+        {displayName}
       </div>
 
       {micMuted && (
@@ -150,6 +306,16 @@ export default function VideoTile({
           <MicOffIcon />
         </div>
       )}
+
+      <button
+        type="button"
+        style={fullscreenBtnStyle}
+        onClick={handleToggleFullscreen}
+        title={isFullscreen ? 'Свернуть' : 'Развернуть'}
+        aria-label={isFullscreen ? 'Свернуть' : 'Развернуть'}
+      >
+        {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
+      </button>
     </div>
   );
 }

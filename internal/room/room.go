@@ -3,7 +3,7 @@
 // Контракт (заполняется агентом):
 //
 //   - NewRegistry() *Registry
-//   - (*Registry).Create(hostName string) *Room  — создаёт комнату, генерит roomID (8 chars Crockford base32 без I/L/O/U)
+//   - (*Registry).Create(hostName string) *Room  — создаёт комнату, генерит roomID (16 chars Crockford base32 без I/L/O/U)
 //   - (*Registry).Get(id string) (*Room, bool)
 //   - (*Registry).Delete(id string)
 //
@@ -37,8 +37,15 @@ type Client struct {
 // crockfordAlphabet — Crockford base32 без I, L, O, U.
 const crockfordAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-// roomIDLen — длина roomID в символах. 8 символов = 40 бит энтропии.
-const roomIDLen = 8
+// roomIDLen — длина roomID в символах. 16 символов = 80 бит энтропии,
+// 32^16 ≈ 1.2×10^24 комбинаций — защита от brute-force через Nostr-relays
+// (там видно roomId всех активных комнат с тем же appId).
+const roomIDLen = 16
+
+// roomIDBytes — сколько крипто-случайных байт нужно, чтобы получить
+// roomIDLen×5 бит. Берём ceil(roomIDLen*5/8) и используем младшие 5 бит
+// каждой 5-битной группы из общего 80-битного буфера.
+const roomIDBytes = (roomIDLen*5 + 7) / 8 // 10 байт для 16 символов
 
 // Registry хранит активные комнаты по их ID.
 type Registry struct {
@@ -171,26 +178,36 @@ func (r *Room) IsEmpty() bool {
 	return len(r.clients) == 0
 }
 
-// generateRoomID — 8-символьный Crockford base32 ID на crypto/rand.
-// Берём 5 байт (40 бит) и режем на 8 групп по 5 бит, маппим в алфавит.
+// generateRoomID — Crockford base32 ID на crypto/rand. Длина управляется
+// константой roomIDLen (текущая = 16 → 80 бит энтропии).
+//
+// Берём roomIDBytes крипто-случайных байт и читаем по 5 бит "слева направо"
+// через bit-shift аккумулятор. Распределение строго равномерное (256 % 32 == 0).
 func generateRoomID() string {
-	var buf [5]byte
-	if _, err := rand.Read(buf[:]); err != nil {
+	buf := make([]byte, roomIDBytes)
+	if _, err := rand.Read(buf); err != nil {
 		// crypto/rand.Read на современных ОС не возвращает ошибок;
 		// падать здесь безопаснее, чем выдавать предсказуемый ID.
 		panic(fmt.Errorf("room: crypto/rand failed: %w", err))
 	}
 
-	// Собираем 40 бит как uint64 (big-endian порядок байтов).
-	var v uint64
-	for _, b := range buf {
-		v = (v << 8) | uint64(b)
-	}
-
 	out := make([]byte, roomIDLen)
-	for i := roomIDLen - 1; i >= 0; i-- {
-		out[i] = crockfordAlphabet[v&0x1F]
-		v >>= 5
+	// Бит-аккумулятор: накапливаем биты из buf, выдаём по 5 в каждый символ.
+	var acc uint32
+	var bits uint // сколько валидных младших бит в acc
+	bi := 0       // индекс следующего байта buf для подгрузки
+	for i := 0; i < roomIDLen; i++ {
+		for bits < 5 && bi < len(buf) {
+			acc = (acc << 8) | uint32(buf[bi])
+			bits += 8
+			bi++
+		}
+		// Извлекаем верхние 5 бит, чтобы шёл естественный big-endian порядок.
+		shift := bits - 5
+		out[i] = crockfordAlphabet[(acc>>shift)&0x1F]
+		// Чистим использованные биты.
+		acc &= (1 << shift) - 1
+		bits -= 5
 	}
 	return string(out)
 }

@@ -38,6 +38,10 @@ type Mode = 'sfu' | 'p2p';
 interface Props {
   roomId: string;
   mode?: 'auto' | 'sfu' | 'p2p';
+  // Pre-shared password из URL hash. Если задан — Trystero шифрует ВСЁ:
+  // signaling SDP/ICE через Nostr-relays + data-channel сообщения. Peer без
+  // правильного password просто не установит peer-connection.
+  password?: string;
 }
 
 interface PeerEntry {
@@ -143,6 +147,28 @@ const modeBadgeStyle: CSSProperties = {
   border: '1px solid var(--border)',
   background: 'var(--bg)',
   color: 'var(--muted)',
+  cursor: 'help',
+  whiteSpace: 'nowrap',
+};
+
+const secureBadgeStyle: CSSProperties = {
+  fontSize: 11,
+  padding: '2px 8px',
+  borderRadius: 4,
+  border: '1px solid rgba(34, 197, 94, 0.4)',
+  background: 'rgba(34, 197, 94, 0.12)',
+  color: 'var(--accent)',
+  cursor: 'help',
+  whiteSpace: 'nowrap',
+};
+
+const insecureBadgeStyle: CSSProperties = {
+  fontSize: 11,
+  padding: '2px 8px',
+  borderRadius: 4,
+  border: '1px solid rgba(234, 179, 8, 0.4)',
+  background: 'rgba(234, 179, 8, 0.12)',
+  color: '#eab308',
   cursor: 'help',
   whiteSpace: 'nowrap',
 };
@@ -343,7 +369,7 @@ async function resolveMode(prop: 'auto' | 'sfu' | 'p2p'): Promise<Mode> {
   }
 }
 
-export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
+export default function Meeting({ roomId, mode: modeProp = 'auto', password }: Props) {
   // Резолвится один раз на mount; до этого UI ждёт.
   const [resolvedMode, setResolvedMode] = useState<Mode | null>(
     modeProp === 'sfu' || modeProp === 'p2p' ? modeProp : null,
@@ -835,7 +861,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       },
     };
 
-    const conn = new P2PMeetConnection(roomId, myDisplay, events);
+    const conn = new P2PMeetConnection(roomId, myDisplay, events, password);
     p2pConnectionRef.current = conn;
 
     try {
@@ -1025,7 +1051,8 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
   };
 
   const handleCopyEndpoint = (key: string, url: string): void => {
-    const fullUrl = `${url}/m/${roomId}`;
+    const hash = password ? `#${password}` : '';
+    const fullUrl = `${url}/m/${roomId}${hash}`;
     const onCopied = (): void => {
       setCopiedKey(key);
       window.setTimeout(() => {
@@ -1150,11 +1177,14 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
 
   // Invite link. В P2P — статика на GitHub Pages с тем же roomId. В SFU —
   // origin текущей страницы + /m/<roomId>.
+  // Если есть password — добавляем как fragment (#<pw>); fragment НЕ уходит
+  // на HTTP-сервер, только клиент его видит → pre-shared key для E2EE.
   const buildInviteUrl = (): string => {
+    const hash = password ? `#${password}` : '';
     if (resolvedMode === 'p2p') {
-      return `${P2P_PUBLIC_HOST}/p2p/${roomId}`;
+      return `${P2P_PUBLIC_HOST}/p2p/${roomId}${hash}`;
     }
-    return `${window.location.origin}/m/${roomId}`;
+    return `${window.location.origin}/m/${roomId}${hash}`;
   };
 
   const handleCopyInvite = (): void => {
@@ -1349,6 +1379,8 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
     isLocal?: boolean;
     micMuted?: boolean;
     camMuted?: boolean;
+    isScreen?: boolean;
+    isLocalScreen?: boolean;
   }> = [];
 
   if (localStream) {
@@ -1369,9 +1401,11 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
     tiles.push({
       id: 'local-screen',
       stream: screenStream,
-      name: `Экран: ${myDisplay}`,
+      name: myDisplay,
       // isLocal=true → VideoTile замьютит audio (ну и audio в screen у нас всё равно false).
       isLocal: true,
+      isScreen: true,
+      isLocalScreen: true,
     });
   }
 
@@ -1392,6 +1426,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
       id: `screen-${key}`,
       stream: entry.stream,
       name: `Экран: ${peerName}`,
+      isScreen: true,
     });
   }
 
@@ -1421,6 +1456,23 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
         <span style={modeBadgeStyle} title={modeBadgeTitle}>
           {modeBadgeLabel}
         </span>
+        {resolvedMode === 'p2p' && (
+          password ? (
+            <span
+              style={secureBadgeStyle}
+              title="Зашифровано (E2EE): сигналинг и data-channel шифруются pre-shared password из ссылки. Без правильной ссылки подключиться нельзя."
+            >
+              🔒 E2EE
+            </span>
+          ) : (
+            <span
+              style={insecureBadgeStyle}
+              title="Без шифрования: кто угодно с этим roomId может зайти. Создайте новый мит, чтобы получить защищённую ссылку."
+            >
+              ⚠ Без шифрования
+            </span>
+          )
+        )}
         {resolvedMode === 'sfu' && <ConnectionBadge stats={stats} />}
         <span style={resBadgeStyle} title={resTitle}>
           {resBadge}
@@ -1462,7 +1514,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto' }: Props) {
             {endpoints!.map((ep, idx) => {
               const key = `${ep.kind}-${ep.host}-${ep.port}-${idx}`;
               const meta = ENDPOINT_KIND_META[ep.kind];
-              const fullUrl = `${ep.url}/m/${roomId}`;
+              const fullUrl = `${ep.url}/m/${roomId}${password ? `#${password}` : ''}`;
               const isCopied = copiedKey === key;
               // Для internet-эндпойнтов уточняем семейство IP в лейбле,
               // т.к. их теперь может быть до двух (ipv4 + ipv6).

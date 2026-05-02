@@ -52,6 +52,9 @@ export class P2PMeetConnection {
   private readonly roomId: string;
   private readonly displayName: string;
   private readonly events: P2PMeetEvents;
+  // Pre-shared password для Trystero E2EE. Если undefined/'' — без шифрования
+  // (back-compat со старыми ссылками /p2p/<8charID> без hash).
+  private readonly password: string | undefined;
 
   private room: Room | null = null;
 
@@ -76,10 +79,17 @@ export class P2PMeetConnection {
   // Чтобы start() нельзя было вызвать дважды.
   private started = false;
 
-  constructor(roomId: string, displayName: string, events: P2PMeetEvents) {
+  constructor(
+    roomId: string,
+    displayName: string,
+    events: P2PMeetEvents,
+    password?: string,
+  ) {
     this.roomId = roomId;
     this.displayName = displayName;
     this.events = events;
+    // Пустую строку трактуем как отсутствие пароля.
+    this.password = password && password.length > 0 ? password : undefined;
   }
 
   get peerCount(): number {
@@ -101,11 +111,21 @@ export class P2PMeetConnection {
       try {
         // rtcConfig: бесплатные публичные STUN+TURN из ice.ts. TURN критичен
         // для symmetric NAT (≈15–20% сетей), без него P2P-mesh не пробьётся.
-        room = joinRoom(
-          { appId: APP_ID, rtcConfig: { iceServers: PUBLIC_ICE_SERVERS } },
-          this.roomId,
+        // password (если задан): Trystero шифрует ВЁС signaling через Nostr-relays
+        // и data-channel сообщения. Peer без правильного password не сможет
+        // расшифровать SDP/ICE → peer-connection не установится.
+        const config: { appId: string; rtcConfig: { iceServers: typeof PUBLIC_ICE_SERVERS }; password?: string } = {
+          appId: APP_ID,
+          rtcConfig: { iceServers: PUBLIC_ICE_SERVERS },
+        };
+        if (this.password) {
+          config.password = this.password;
+        }
+        room = joinRoom(config, this.roomId);
+        console.info(
+          '[zubrameet/p2p] joined room via Trystero/Nostr',
+          this.password ? '(E2EE)' : '(no password)',
         );
-        console.info('[zubrameet/p2p] joined room via Trystero/Nostr');
       } catch (err) {
         this.reportError(err, 'joinRoom');
         return;

@@ -43,15 +43,31 @@ function getPath(): string {
 interface RouteMatch {
   roomId: string;
   mode: 'auto' | 'p2p';
+  // Pre-shared password из URL hash (всё после `#`). Hash в браузерах НЕ
+  // отправляется на HTTP-сервер — только клиентский JS его видит. Используется
+  // как pre-shared key для Trystero E2EE (signaling SDP/ICE + data-channel).
+  password?: string;
+}
+
+function readHashPassword(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const raw = window.location.hash.replace(/^#/, '');
+  return raw.length > 0 ? raw : undefined;
 }
 
 function parseRoute(path: string): RouteMatch | null {
+  const password = readHashPassword();
   // /p2p/<roomId> — принудительно P2P. Проверяем ПЕРВЫМ, чтобы не съел /m/.
   const p2p = /^\/p2p\/([^/]+)\/?$/.exec(path);
-  if (p2p) return { roomId: p2p[1]!, mode: 'p2p' };
-  // /m/<roomId> — auto-detect.
+  if (p2p) {
+    return { roomId: p2p[1]!, mode: 'p2p', password };
+  }
+  // /m/<roomId> — auto-detect. Hash также пробрасываем (на случай если /api/mode
+  // вернёт p2p — пароль уже будет под рукой).
   const m = /^\/m\/([^/]+)\/?$/.exec(path);
-  if (m) return { roomId: m[1]!, mode: 'auto' };
+  if (m) {
+    return { roomId: m[1]!, mode: 'auto', password };
+  }
   return null;
 }
 
@@ -73,7 +89,13 @@ export default function App() {
   }
   const route = parseRoute(path);
   if (route) {
-    return <Meeting roomId={route.roomId} mode={route.mode} />;
+    return (
+      <Meeting
+        roomId={route.roomId}
+        mode={route.mode}
+        password={route.password}
+      />
+    );
   }
   return <Landing />;
 }

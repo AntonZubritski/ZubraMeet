@@ -127,8 +127,8 @@ func TestRoomIDFormat(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		room := reg.Create("Host")
 		id := room.ID()
-		if len(id) != 8 {
-			t.Fatalf("room ID %q has length %d, want 8", id, len(id))
+		if len(id) != roomIDLen {
+			t.Fatalf("room ID %q has length %d, want %d", id, len(id), roomIDLen)
 		}
 		for j := 0; j < len(id); j++ {
 			if !allowed[id[j]] {

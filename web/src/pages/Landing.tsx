@@ -14,15 +14,33 @@ const NAME_KEY = 'zubrameet.name';
 // Crockford base32 без I/L/O/U — совпадает с server-side internal/room.
 const CROCKFORD_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
-function generateRoomId(): string {
-  const len = 8;
+// 16 символов Crockford base32 = 80 бит энтропии, 32^16 ≈ 1.2×10^24 комбинаций.
+// Защищает от brute-force через Nostr-relays (там видно roomId активных комнат).
+const ROOM_ID_LEN = 16;
+
+// 22 символа Crockford base32 = 110 бит — равноценно UUIDv4. Передаётся в URL hash.
+const PASSWORD_LEN = 22;
+
+// Сэмплер crypto-рандомных Crockford-символов с rejection sampling, чтобы
+// распределение было строго равномерным (256 % 32 == 0, поэтому достаточно
+// просто бит-маски 0x1F — но на всякий случай делаем явно).
+function generateCrockford(len: number): string {
   const bytes = new Uint8Array(len);
   crypto.getRandomValues(bytes);
   let out = '';
   for (let i = 0; i < len; i++) {
-    out += CROCKFORD_ALPHABET[bytes[i]! % CROCKFORD_ALPHABET.length];
+    // 0x1F = 31 — старшие 3 бита отбрасываем; нижние 5 бит идеально мапятся в алфавит из 32.
+    out += CROCKFORD_ALPHABET[bytes[i]! & 0x1f];
   }
   return out;
+}
+
+function generateRoomId(): string {
+  return generateCrockford(ROOM_ID_LEN);
+}
+
+function generatePassword(): string {
+  return generateCrockford(PASSWORD_LEN);
 }
 
 const pageStyle: CSSProperties = {
@@ -161,6 +179,9 @@ export default function Landing() {
     }
   });
   const [roomId, setRoomId] = useState<string>('');
+  // Опциональный пароль для join: если пользователь вводит roomId руками,
+  // он может также вставить пароль (Crockford base32). Пустой = legacy mode (без E2EE).
+  const [joinPassword, setJoinPassword] = useState<string>('');
   const [creating, setCreating] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string | null>(null);
@@ -207,6 +228,10 @@ export default function Landing() {
     setRoomId(e.target.value.toUpperCase());
   };
 
+  const onJoinPasswordChange = (e: ChangeEvent<HTMLInputElement>): void => {
+    setJoinPassword(e.target.value.toUpperCase());
+  };
+
   const trimmedName = name.trim();
   const trimmedRoom = roomId.trim();
 
@@ -222,8 +247,11 @@ export default function Landing() {
     setCreating(true);
     try {
       // На статике (GitHub Pages) бэка нет — генерим roomId локально и в P2P.
+      // Сразу с password в URL hash → E2EE для гостей по полной invite-ссылке.
       if (serverless) {
-        navigate(`/p2p/${generateRoomId()}`);
+        const id = generateRoomId();
+        const pw = generatePassword();
+        navigate(`/p2p/${id}#${pw}`);
         return;
       }
       // Локальный сервер: пробуем POST /api/rooms; на ошибку — fallback в P2P.
@@ -234,7 +262,9 @@ export default function Landing() {
       });
       if (!resp.ok) {
         if (resp.status === 405 || resp.status === 404) {
-          navigate(`/p2p/${generateRoomId()}`);
+          const id = generateRoomId();
+          const pw = generatePassword();
+          navigate(`/p2p/${id}#${pw}`);
           return;
         }
         throw new Error(`HTTP ${resp.status}`);
@@ -255,7 +285,11 @@ export default function Landing() {
   const handleJoin = (e: FormEvent): void => {
     e.preventDefault();
     if (joinDisabled) return;
-    navigate(serverless ? `/p2p/${trimmedRoom}` : `/m/${trimmedRoom}`);
+    const trimmedPw = joinPassword.trim();
+    // Только в P2P-режиме передаём password в URL hash. SFU-режим игнорирует
+    // password (там сигналинг идёт через свой WS-сервер, шифрование не нужно).
+    const target = serverless ? `/p2p/${trimmedRoom}` : `/m/${trimmedRoom}`;
+    navigate(serverless && trimmedPw.length > 0 ? `${target}#${trimmedPw}` : target);
   };
 
   return (
@@ -318,6 +352,23 @@ export default function Landing() {
               maxLength={32}
             />
           </label>
+
+          {serverless !== false && (
+            <label style={labelStyle}>
+              Пароль (если есть)
+              <input
+                type="text"
+                value={joinPassword}
+                onChange={onJoinPasswordChange}
+                placeholder="Из ссылки после #"
+                autoCapitalize="characters"
+                autoCorrect="off"
+                spellCheck={false}
+                style={{ ...inputStyle, textTransform: 'uppercase', letterSpacing: 1 }}
+                maxLength={64}
+              />
+            </label>
+          )}
 
           <button
             type="submit"
