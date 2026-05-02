@@ -443,13 +443,21 @@ export default function VideoTile({
     >
       {/* Видео ВСЕГДА в DOM с прикреплённым srcObject. При камере off мы
           просто накладываем placeholder сверху — video продолжает жить и
-          мгновенно появляется при включении (без re-attach stream). */}
+          мгновенно появляется при включении (без re-attach stream).
+
+          Атрибуты гасят браузерные controls которые появляются на
+          fullscreen видео в Chrome/Brave (PiP, Cast/Share-tab, download,
+          remote-playback) — иначе зритель случайно жмёт "Поделиться этой
+          вкладкой" и стартует свой screen-share. */}
       <video
         ref={videoRef}
         style={videoStyle}
         autoPlay
         playsInline
         muted={isLocal || micMuted}
+        disablePictureInPicture
+        disableRemotePlayback
+        controlsList="nodownload nofullscreen noremoteplayback noplaybackrate"
       />
       {camMuted && (
         <div style={placeholderStyle} aria-label={`Камера выключена: ${name}`}>
