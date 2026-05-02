@@ -2,8 +2,10 @@
 /zubrameet
 /zubrameet.exe
 *.exe
+*.exe~
 *.test
 *.out
+*~
 
 # Node / web
 node_modules/
