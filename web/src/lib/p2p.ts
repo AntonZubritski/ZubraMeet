@@ -79,6 +79,22 @@ export interface ReactionPayload {
   [key: string]: string | number;
 }
 
+// GIF-реакция через data-channel ('gif-reaction' action). Передаём URL картинки
+// (https-only, длина < 2000 — защита от XSS/data:/javascript:) + размеры,
+// чтобы receiver мог отрендерить с правильным aspect ratio. Анимация — та же
+// fall-down что и у emoji. Источник URL — Klipy CDN (cdn.klipy.com и др.),
+// но валидация белым списком хостов слишком хрупка — полагаемся на https://
+// + length cap + рендер через <img> (браузер не выполнит script если src
+// окажется HTML/SVG со встроенным js, потому что rendering context — image).
+export interface GifReactionPayload {
+  url: string;
+  width: number;
+  height: number;
+  ts: number;
+  fromName: string;
+  [key: string]: string | number;
+}
+
 export interface P2PMeetEvents {
   onLocalStream(stream: MediaStream): void;
   // kind — 'camera' (default) | 'screen'. Опционален для backwards compat:
@@ -108,6 +124,8 @@ export interface P2PMeetEvents {
   onChatMessage?(peerId: string, msg: ChatMessage): void;
   // Получена emoji-реакция. peerId === 'self' для своих реакций.
   onReaction?(peerId: string, payload: ReactionPayload): void;
+  // Получена GIF-реакция. peerId === 'self' для своих.
+  onGifReaction?(peerId: string, payload: GifReactionPayload): void;
 }
 
 const APP_ID = 'zubrameet';
@@ -141,6 +159,8 @@ export class P2PMeetConnection {
   private sendChat: ActionSender<ChatMessage> | null = null;
   // 'reaction' action — отправка одиночных emoji для floating-анимации.
   private sendReactionAction: ActionSender<ReactionPayload> | null = null;
+  // 'gif-reaction' action — отправка GIF (URL+размеры) для floating-анимации.
+  private sendGifReactionAction: ActionSender<GifReactionPayload> | null = null;
   // Текущее локальное cam/mic state. По умолчанию обе включены — это
   // отражает поведение acquireMedia + setMicOn(true)/setCamOn(true) в Meeting.tsx.
   private localMediaState: P2PMediaState = { cam: true, mic: true };
@@ -367,6 +387,49 @@ export class P2PMeetConnection {
           this.events.onReaction?.(peerId, safe);
         } catch (err) {
           this.reportError(err, 'getReaction');
+        }
+      });
+
+      // gif-reaction action — GIF URL (Klipy CDN) для floating-анимации.
+      // Защита от XSS/абуза:
+      //   - url начинается с 'https://' (отрезаем data:, javascript:, file:)
+      //   - длина url < 2000 (типичный CDN URL ≈ 80-150 chars; cap с запасом)
+      //   - width/height приводим к разумным числам (1..4096)
+      // Trystero сериализует через JSON в data-channel — sane payload size limit
+      // там тоже есть, но 2000 chars * peerCount всё равно мизер.
+      const [sendGifReactionAction, getGifReaction] =
+        room.makeAction<GifReactionPayload>('gif-reaction');
+      this.sendGifReactionAction = sendGifReactionAction;
+      getGifReaction((data, peerId) => {
+        try {
+          if (!data || typeof data !== 'object') return;
+          const g = data as GifReactionPayload;
+          if (
+            typeof g.url !== 'string' ||
+            typeof g.width !== 'number' ||
+            typeof g.height !== 'number' ||
+            typeof g.ts !== 'number' ||
+            typeof g.fromName !== 'string'
+          ) {
+            return;
+          }
+          if (!g.url.startsWith('https://')) return;
+          if (g.url.length > 2000) return;
+          const clampDim = (n: number): number => {
+            if (!Number.isFinite(n) || n <= 0) return 240;
+            if (n > 4096) return 4096;
+            return Math.round(n);
+          };
+          const safe: GifReactionPayload = {
+            url: g.url,
+            width: clampDim(g.width),
+            height: clampDim(g.height),
+            ts: g.ts,
+            fromName: g.fromName.slice(0, 64),
+          };
+          this.events.onGifReaction?.(peerId, safe);
+        } catch (err) {
+          this.reportError(err, 'getGifReaction');
         }
       });
 
@@ -818,6 +881,42 @@ export class P2PMeetConnection {
     }
   }
 
+  /**
+   * Бродкастит GIF-реакцию всем peer'ам и эмитит её локально (peerId='self'),
+   * чтобы у отправителя тоже отрисовалась анимация. Тихо игнорирует не-https URL
+   * и слишком длинные строки — receiver всё равно их отвергает, но фильтр здесь
+   * экономит лишний трафик в data-channel.
+   */
+  sendGifReaction(url: string, width: number, height: number): void {
+    if (!this.sendGifReactionAction) return;
+    if (typeof url !== 'string' || !url.startsWith('https://')) return;
+    if (url.length === 0 || url.length > 2000) return;
+    const w = Number.isFinite(width) && width > 0 ? Math.round(width) : 240;
+    const h = Number.isFinite(height) && height > 0 ? Math.round(height) : 240;
+    const payload: GifReactionPayload = {
+      url,
+      width: w > 4096 ? 4096 : w,
+      height: h > 4096 ? 4096 : h,
+      ts: Date.now(),
+      fromName: this.displayName,
+    };
+    try {
+      const result: unknown = this.sendGifReactionAction(payload);
+      if (result && typeof (result as Promise<unknown>).then === 'function') {
+        (result as Promise<unknown>).catch((err: unknown) => {
+          this.reportError(err, 'sendGifReaction(broadcast)');
+        });
+      }
+    } catch (err) {
+      this.reportError(err, 'sendGifReaction(broadcast)');
+    }
+    try {
+      this.events.onGifReaction?.('self', payload);
+    } catch (err) {
+      this.reportError(err, 'onGifReaction(self)');
+    }
+  }
+
   setMediaState(state: P2PMediaState): void {
     this.localMediaState = { cam: state.cam, mic: state.mic };
     if (!this.sendMediaState) {
@@ -865,6 +964,7 @@ export class P2PMeetConnection {
     this.sendScreenState = null;
     this.sendChat = null;
     this.sendReactionAction = null;
+    this.sendGifReactionAction = null;
     this.cameraStream = null;
     this.peerNames.clear();
     this.peerStreams.clear();

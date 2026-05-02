@@ -516,6 +516,32 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // setTimeout, чтобы DOM-нода ушла после завершения анимации.
   const [reactions, setReactions] = useState<FloatingReaction[]>([]);
 
+  // Стабильный per-user идентификатор для Klipy API (формальное требование
+  // их customer_id-параметра для analytics/personalisation). Генерируется
+  // один раз и хранится в localStorage; если localStorage недоступен —
+  // ephemeral uuid в памяти. Передаётся в Controls → EmojiPicker.
+  const customerIdRef = useRef<string>('');
+  if (customerIdRef.current.length === 0) {
+    let id = '';
+    try {
+      id = window.localStorage.getItem('zubrameet.customerId') ?? '';
+      if (id.length === 0) {
+        id =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        window.localStorage.setItem('zubrameet.customerId', id);
+      }
+    } catch {
+      // SSR / disabled storage — ephemeral id, всё равно валиден для одной сессии.
+      id =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+    customerIdRef.current = id;
+  }
+
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
   const sfuConnectionRef = useRef<MeetConnection | null>(null);
@@ -1121,8 +1147,34 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         const leftPct = 10 + Math.random() * 80; // 10–90%
         const swayPx = (Math.random() * 2 - 1) * 50; // ±50px
         const reaction: FloatingReaction = {
+          kind: 'emoji',
           id,
           emoji: payload.emoji,
+          leftPct,
+          swayPx,
+        };
+        setReactions((prev) => [...prev, reaction]);
+        window.setTimeout(() => {
+          setReactions((prev) => prev.filter((r) => r.id !== id));
+        }, 5000);
+      },
+      onGifReaction: (_peerId, payload) => {
+        // Аналогично emoji, но это GIF — рендерится как <img> в ReactionsLayer.
+        // Тот же 5s lifecycle. URL уже провалидирован в p2p.ts (https://, length).
+        const id =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `g-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        // Гифки шире emoji — сужаем диапазон leftPct, чтобы не обрезались
+        // об края viewport'а (ReactionsLayer ограничивает width до 160px).
+        const leftPct = 15 + Math.random() * 70;
+        const swayPx = (Math.random() * 2 - 1) * 40;
+        const reaction: FloatingReaction = {
+          kind: 'gif',
+          id,
+          url: payload.url,
+          width: payload.width,
+          height: payload.height,
           leftPct,
           swayPx,
         };
@@ -1491,6 +1543,11 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // Отправка emoji-реакции. Аналогично — только P2P.
   const handleSendReaction = (emoji: string): void => {
     p2pConnectionRef.current?.sendReaction(emoji);
+  };
+
+  // Отправка GIF-реакции (URL+размеры через Klipy). Только P2P.
+  const handleSendGif = (url: string, width: number, height: number): void => {
+    p2pConnectionRef.current?.sendGifReaction(url, width, height);
   };
 
   const handleLeave = (): void => {
@@ -2152,6 +2209,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         onLeave={handleLeave}
         onCopyInvite={handleCopyInvite}
         onSendReaction={handleSendReaction}
+        // GIF-реакции работают только в P2P (data-channel в Trystero); SFU-режим
+        // пока не пробрасывает кастомные actions, поэтому в нём GIF-tab скрыт.
+        {...(resolvedMode === 'p2p' ? { onSendGif: handleSendGif } : {})}
+        customerId={customerIdRef.current}
         chatOpen={chatOpen}
         unreadChat={unreadChat}
         onToggleChat={handleToggleChat}

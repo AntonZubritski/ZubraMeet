@@ -30,6 +30,10 @@ interface Props {
   // Выбор emoji вызывает onSendReaction(emoji) — родитель прокидывает в
   // P2PMeetConnection.sendReaction.
   onSendReaction(emoji: string): void;
+  // GIF-реакция через Klipy. Optional: если undefined — GIF-tab в picker'е
+  // не отрисуется. customerId — стабильный per-user id для Klipy analytics.
+  onSendGif?(url: string, width: number, height: number): void;
+  customerId?: string;
   // Чат-sidebar: toggle открытия. unreadChat — счётчик непрочитанных
   // сообщений (рендерится бейджем над кнопкой). Когда чат уже открыт,
   // unreadChat должен быть 0 (родитель сбрасывает на open).
@@ -618,15 +622,24 @@ function ScreenShareControl({
 // Smile-кнопка с popover. Popover EmojiPicker сам слушает clickoutside/Esc.
 // Здесь — только круглая кнопка + ref-обёртка для абсолютного позиционирования.
 interface SmileButtonProps {
-  onPick(emoji: string): void;
+  onPickEmoji(emoji: string): void;
+  onPickGif?(url: string, width: number, height: number): void;
+  customerId?: string;
 }
-function SmileButton({ onPick }: SmileButtonProps) {
+function SmileButton({ onPickEmoji, onPickGif, customerId }: SmileButtonProps) {
   const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
 
-  const handlePick = (emoji: string): void => {
-    onPick(emoji);
+  const handlePickEmoji = (emoji: string): void => {
+    onPickEmoji(emoji);
+    // Emoji — закрываем picker сразу (одного клика обычно достаточно).
     setOpen(false);
+  };
+
+  const handlePickGif = (url: string, width: number, height: number): void => {
+    if (onPickGif) onPickGif(url, width, height);
+    // GIF — НЕ закрываем picker, чтобы можно было отправить ещё. Закрытие
+    // через Escape / клик-вне (handled внутри EmojiPicker).
   };
 
   const wrapperStyle: CSSProperties = {
@@ -653,7 +666,14 @@ function SmileButton({ onPick }: SmileButtonProps) {
       >
         <SmileIcon />
       </button>
-      {open && <EmojiPicker onPick={handlePick} onClose={() => setOpen(false)} />}
+      {open && (
+        <EmojiPicker
+          onSelectEmoji={handlePickEmoji}
+          {...(onPickGif ? { onSelectGif: handlePickGif } : {})}
+          {...(customerId ? { customerId } : {})}
+          onClose={() => setOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -736,6 +756,8 @@ export default function Controls({
   onLeave,
   onCopyInvite,
   onSendReaction,
+  onSendGif,
+  customerId,
   chatOpen,
   unreadChat,
   onToggleChat,
@@ -771,7 +793,11 @@ export default function Controls({
         />
       )}
 
-      <SmileButton onPick={onSendReaction} />
+      <SmileButton
+        onPickEmoji={onSendReaction}
+        {...(onSendGif ? { onPickGif: onSendGif } : {})}
+        {...(customerId ? { customerId } : {})}
+      />
 
       <ChatButton open={chatOpen} unread={unreadChat} onClick={onToggleChat} />
 
