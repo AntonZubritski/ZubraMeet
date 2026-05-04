@@ -23,7 +23,12 @@
 // третий аргумент в Trystero — metadata, передаётся приёмнику в onPeerStream
 // третьим аргументом. По нему различаем camera vs screen.
 
-import { joinRoom, type Room, type ActionSender } from '@trystero-p2p/mqtt';
+import {
+  joinRoom,
+  getRelaySockets,
+  type Room,
+  type ActionSender,
+} from '@trystero-p2p/mqtt';
 import { PUBLIC_ICE_SERVERS } from './ice';
 import {
   DEFAULT_SCREEN_QUALITY,
@@ -236,19 +241,31 @@ export class P2PMeetConnection {
         // и data-channel сообщения. Peer без правильного password не сможет
         // расшифровать SDP/ICE → peer-connection не установится.
         //
-        // relayConfig не передаём — @trystero-p2p/mqtt идёт со встроенным
-        // дефолтным списком из 5 публичных MQTT-брокеров (mosquitto, EMQX,
-        // HiveMQ, shiftr.io). Они исторически принимают анонимный pub/sub
-        // трафик без регистрации и без жёстких rate-limit'ов; для WebRTC-
-        // signaling этого хватает. Если в будущем какой-то broker отвалится —
-        // можно будет передать свой `relayConfig: { urls: [...] }`.
+        // relayConfig.urls: явно перечисляем ВСЕ 5 встроенных публичных
+        // MQTT-брокеров. По умолчанию Trystero/mqtt берёт первые 4
+        // (defaultRedundancy=4) — broker.hivemq.com (5-й в списке) выпадает.
+        // А mosquitto:8081/mqtt (1-й) часто вообще не отвечает по WSS, так что
+        // дефолтный slice может оставить юзера фактически без brokers.
+        // Передаём весь набор — Trystero использует список целиком (без slice
+        // когда .urls задан), и подключение к любому общему живому broker'у
+        // достаточно для discovery.
         const config: {
           appId: string;
           rtcConfig: { iceServers: typeof PUBLIC_ICE_SERVERS };
           password?: string;
+          relayConfig: { urls: string[] };
         } = {
           appId: APP_ID,
           rtcConfig: { iceServers: PUBLIC_ICE_SERVERS },
+          relayConfig: {
+            urls: [
+              'wss://broker.hivemq.com:8884/mqtt',
+              'wss://broker.emqx.io:8084/mqtt',
+              'wss://broker-cn.emqx.io:8084/mqtt',
+              'wss://test.mosquitto.org:8081/mqtt',
+              'wss://public:public@public.cloud.shiftr.io',
+            ],
+          },
         };
         if (this.password) {
           config.password = this.password;
@@ -258,6 +275,30 @@ export class P2PMeetConnection {
           '[zubrameet/p2p] joined room via Trystero/MQTT',
           this.password ? '(E2EE)' : '(no password)',
         );
+
+        // Диагностика: периодически логируем состояние WebSocket-соединений
+        // ко всем MQTT-broker'ам. Trystero сам не сообщает каких relay'ев он
+        // подцепил живыми, и пока хотя бы один общий broker не работает у
+        // обоих peer'ов — discovery молча не сработает. Этот лог даёт нам
+        // явную картину «вот что у меня живо».
+        // 1=CONNECTING, 2=OPEN, 3=CLOSING, 4=CLOSED
+        const dumpRelayHealth = () => {
+          try {
+            const sockets = getRelaySockets() as Record<string, WebSocket>;
+            const lines: string[] = [];
+            for (const [url, ws] of Object.entries(sockets)) {
+              const state = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] ?? `?${ws.readyState}`;
+              lines.push(`  ${state.padEnd(10)} ${url}`);
+            }
+            console.info('[zubrameet/p2p] relay health:\n' + lines.join('\n'));
+          } catch (err) {
+            console.warn('[zubrameet/p2p] relay health probe failed', err);
+          }
+        };
+        // Первая проверка после короткой задержки (broker'ам нужно время на
+        // handshake), потом каждые 10 сек пока кто-то не приконнектится.
+        window.setTimeout(dumpRelayHealth, 3000);
+        window.setTimeout(dumpRelayHealth, 10000);
       } catch (err) {
         this.reportError(err, 'joinRoom');
         return;
