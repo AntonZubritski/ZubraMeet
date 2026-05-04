@@ -18,7 +18,8 @@ import {
 import { navigate } from '../App';
 import { SignalClient, buildWsUrl } from '../lib/signal';
 import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
-import { P2PMeetConnection, type P2PMeetEvents } from '../lib/p2p';
+import type { P2PMeetEvents } from '../lib/p2p';
+import { CFSFUConnection } from '../lib/cf-sfu';
 import { getIceServers } from '../lib/ice';
 import {
   DEFAULT_SCREEN_QUALITY,
@@ -561,7 +562,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
   const sfuConnectionRef = useRef<MeetConnection | null>(null);
-  const p2pConnectionRef = useRef<P2PMeetConnection | null>(null);
+  // P2P-режим теперь использует CFSFUConnection (Cloudflare Realtime SFU)
+  // вместо Trystero/MQTT mesh. API совместим — те же события, те же методы,
+  // только под капотом всё едет через CF anycast SFU вместо peer-to-peer.
+  const p2pConnectionRef = useRef<CFSFUConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const statsTimerRef = useRef<number | null>(null);
   const recoveringRef = useRef<boolean>(false);
@@ -1219,7 +1223,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       },
     };
 
-    const conn = new P2PMeetConnection(roomId, myDisplay, events, password);
+    const conn = new CFSFUConnection(roomId, myDisplay, events, password);
     p2pConnectionRef.current = conn;
 
     try {

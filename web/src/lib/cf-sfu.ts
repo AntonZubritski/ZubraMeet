@@ -1,0 +1,726 @@
+// CF SFU режим. Каждый клиент держит ОДИН RTCPeerConnection к Cloudflare
+// Realtime SFU (вместо N peer-connections к каждому участнику в P2P-mesh).
+// Все аудио/видео идут через CF anycast edge — нет NAT-traversal'а между
+// клиентами, нет TURN, низкая latency cross-country.
+//
+// Преимущества над P2P-mesh для нашего сценария (cross-country, мобильные
+// провайдеры за CGNAT):
+//  - не нужен TURN (CF SFU сам ретранслирует, бесплатно 1TB/мес)
+//  - подключение в ~1-1.5 сек вместо 4 сек (нет ICE-handshake между peers,
+//    только peer↔CF, который anycast и pre-warmed)
+//  - линейный масштаб по нагрузке клиента: один upstream + N downstream'ов,
+//    вместо N upstream'ов в P2P-mesh
+//
+// Архитектура:
+//  1. Каждый клиент создаёт CF Realtime session (POST /sessions/new) →
+//     получает sessionId
+//  2. Публикует свои аудио/видео tracks (POST /sessions/{id}/tracks/new
+//     с location='local' и нашим SDP offer'ом) → CF возвращает answer
+//  3. Через signaling Worker (Durable Object на комнату) обменивается
+//     sessionId с другими peer'ами в комнате
+//  4. Когда узнаёт о новом peer'е с sessionId — pull'ит его tracks
+//     (POST /sessions/{id}/tracks/new с location='remote', sessionId,
+//     trackName) → CF присылает свой offer (renegotiate), мы отвечаем
+//     answer'ом, начинают приходить ontrack-события
+//
+// Чат/реакции/mediaState идут через тот же signaling Worker (точечная
+// пересылка peer→peer). У CF SFU нет арбитрарных data-channels между
+// клиентами — только media. Latency для chat ~200ms, что приемлемо.
+//
+// API совместим с P2PMeetConnection — Meeting.tsx может использовать оба
+// без изменений (только тип конструктора другой).
+
+import {
+  DEFAULT_SCREEN_QUALITY,
+  type ScreenQuality,
+} from './screen-quality';
+import type {
+  RemoteStreamKind,
+  P2PMediaState,
+  ChatMessage,
+  ReactionPayload,
+  GifReactionPayload,
+  P2PMeetEvents,
+} from './p2p';
+
+// Реэкспортируем — Meeting.tsx может импортировать всё из cf-sfu.ts.
+export type {
+  RemoteStreamKind,
+  P2PMediaState,
+  P2PScreenState,
+  ChatMessage,
+  ReactionPayload,
+  GifReactionPayload,
+  P2PMeetEvents,
+} from './p2p';
+
+const SIGNAL_WS_BASE = 'wss://zubrameet-signal.ant-zubritski.workers.dev/room';
+const SFU_API_BASE = 'https://zubrameet-sfu-proxy.ant-zubritski.workers.dev';
+
+// Имена tracks как они известны CF SFU. Должны совпадать на publisher и
+// subscriber'ах — иначе CF не найдёт что pull'ить.
+const TRACK_MIC = 'mic';
+const TRACK_CAMERA = 'camera';
+
+// Bundle-policy 'max-bundle' — все tracks через один transport. Рекомендуется
+// CF docs, минимизирует количество ICE-кандидатов.
+const PC_CONFIG: RTCConfiguration = {
+  iceServers: [],  // CF SFU обрабатывает ICE на своей стороне
+  bundlePolicy: 'max-bundle',
+};
+
+interface PeerEntry {
+  peerId: string;
+  sessionId: string | null;
+  name: string;
+  // Один MediaStream под audio+video peer'а. Создаётся при первом ontrack.
+  cameraStream: MediaStream | null;
+  // Уже отправили ли onRemoteStream для этого peer'а (чтобы не дублировать).
+  emittedCamera: boolean;
+}
+
+// Что хранится в response.tracks от CF после pull-запроса. Мы маппим mid → peerId
+// чтобы при ontrack-событии знать, какой peer приехал.
+interface MidMapping {
+  peerId: string;
+  kind: RemoteStreamKind;
+  trackName: string;
+}
+
+interface AppSignalEnvelope {
+  kind: 'name' | 'media' | 'chat' | 'reaction' | 'gif-reaction';
+  // shape зависит от kind
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  data: any;
+}
+
+export class CFSFUConnection {
+  private readonly roomId: string;
+  private readonly displayName: string;
+  private readonly events: P2PMeetEvents;
+  private readonly peerId: string;
+
+  private sessionId: string | null = null;
+  private pc: RTCPeerConnection | null = null;
+  private ws: WebSocket | null = null;
+
+  // Локальное cam/mic state, синхронизируется с peer'ами через signal/media.
+  private localMediaState: P2PMediaState = { cam: true, mic: true };
+
+  private readonly peers: Map<string, PeerEntry> = new Map();
+  // mid → (peerId, kind). Заполняется из ответов /tracks/new (location='remote').
+  private readonly midToPeer: Map<string, MidMapping> = new Map();
+  // peerId → set of mids — для cleanup при peer-left.
+  private readonly peerToMids: Map<string, Set<string>> = new Map();
+
+  // Чтобы pulls для нескольких peer'ов разом батчились в один tracks/new вызов.
+  private readonly pullQueue: Set<string> = new Set();
+  private pullTimer: number | null = null;
+
+  // Renegotiation мьютекс — параллельные tracks/new ломают SDP state.
+  private negotiationLock: Promise<void> = Promise.resolve();
+
+  private closed = false;
+  private started = false;
+
+  constructor(
+    roomId: string,
+    displayName: string,
+    events: P2PMeetEvents,
+    // password принят для API-совместимости с P2PMeetConnection, но в CF SFU
+    // режиме не используется — CF сам шифрует SRTP. Доступ к комнате
+    // регулируется уникальностью roomId. Если нужна явная авторизация —
+    // добавим серверную проверку в signaling Worker'е.
+    _password?: string,
+  ) {
+    this.roomId = roomId;
+    this.displayName = displayName;
+    this.events = events;
+    this.peerId = generatePeerId();
+  }
+
+  get peerCount(): number {
+    return this.peers.size;
+  }
+
+  // ─── lifecycle ─────────────────────────────────────────────────────────────
+
+  async start(localStream: MediaStream): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+    console.info('[zubrameet/cf-sfu] start', {
+      roomId: this.roomId,
+      name: this.displayName,
+      peerId: this.peerId,
+    });
+
+    try {
+      this.events.onLocalStream(localStream);
+    } catch (err) {
+      this.reportError(err, 'onLocalStream');
+    }
+
+    // Параллелим signaling-connect и SFU-publish — обе сетевые операции
+    // независимы до момента announce.
+    const signalP = this.connectSignal();
+    const publishP = this.setupPCAndPublish(localStream);
+
+    try {
+      await Promise.all([signalP, publishP]);
+    } catch (err) {
+      this.reportError(err, 'start');
+      return;
+    }
+
+    // Сообщаем всем в комнате наш sessionId — чтобы они начали pull нашего media.
+    this.announceSession();
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.pullTimer !== null) {
+      window.clearTimeout(this.pullTimer);
+      this.pullTimer = null;
+    }
+    if (this.pc) {
+      try { this.pc.close(); } catch { /* ignore */ }
+      this.pc = null;
+    }
+    if (this.ws) {
+      try { this.ws.close(1000, 'leaving'); } catch { /* ignore */ }
+      this.ws = null;
+    }
+    this.peers.clear();
+    this.midToPeer.clear();
+    this.peerToMids.clear();
+    this.pullQueue.clear();
+  }
+
+  // ─── signaling ─────────────────────────────────────────────────────────────
+
+  private connectSignal(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const url = `${SIGNAL_WS_BASE}/${encodeURIComponent(this.roomId)}?peerId=${this.peerId}`;
+      const ws = new WebSocket(url);
+      this.ws = ws;
+
+      const onOpen = () => {
+        ws.removeEventListener('error', onError);
+        console.info('[zubrameet/cf-sfu] signal connected');
+        resolve();
+      };
+      const onError = () => {
+        ws.removeEventListener('open', onOpen);
+        reject(new Error('signal connect failed'));
+      };
+      ws.addEventListener('open', onOpen, { once: true });
+      ws.addEventListener('error', onError, { once: true });
+
+      ws.addEventListener('message', (ev) => {
+        let msg: unknown;
+        try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : ''); }
+        catch { return; }
+        this.handleSignalMessage(msg);
+      });
+
+      ws.addEventListener('close', (ev) => {
+        if (this.closed) return;
+        this.reportError(
+          new Error(`signal disconnected (code=${ev.code})`),
+          'ws close',
+        );
+      });
+    });
+  }
+
+  private announceSession(): void {
+    if (!this.sessionId || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ type: 'announce', sessionId: this.sessionId }));
+    } catch (err) {
+      this.reportError(err, 'announceSession');
+    }
+  }
+
+  private sendAppSignal(targetPeerId: string, payload: AppSignalEnvelope): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({
+        type: 'signal',
+        target: targetPeerId,
+        payload,
+      }));
+    } catch (err) {
+      this.reportError(err, 'sendAppSignal');
+    }
+  }
+
+  private broadcastAppSignal(payload: AppSignalEnvelope): void {
+    for (const peerId of this.peers.keys()) {
+      this.sendAppSignal(peerId, payload);
+    }
+  }
+
+  private handleSignalMessage(msg: unknown): void {
+    if (!msg || typeof msg !== 'object') return;
+    const m = msg as { type?: string; [k: string]: unknown };
+    switch (m.type) {
+      case 'welcome': {
+        const peers = m.peers as Array<{ peerId: string; sessionId: string | null }> | undefined;
+        if (Array.isArray(peers)) {
+          for (const p of peers) this.handlePeerKnown(p.peerId, p.sessionId);
+        }
+        break;
+      }
+      case 'peer-joined': {
+        const peerId = m.peerId as string;
+        const sessionId = (m.sessionId as string | null) ?? null;
+        if (typeof peerId === 'string') this.handlePeerKnown(peerId, sessionId);
+        break;
+      }
+      case 'peer-left': {
+        const peerId = m.peerId as string;
+        if (typeof peerId === 'string') this.handlePeerLeft(peerId);
+        break;
+      }
+      case 'signal': {
+        const from = m.from as string;
+        const payload = m.payload as AppSignalEnvelope;
+        if (typeof from === 'string' && payload && typeof payload === 'object') {
+          this.handleAppSignal(from, payload);
+        }
+        break;
+      }
+    }
+  }
+
+  private handlePeerKnown(peerId: string, sessionId: string | null): void {
+    let entry = this.peers.get(peerId);
+    if (!entry) {
+      entry = {
+        peerId,
+        sessionId,
+        name: 'Участник',  // настоящее имя придёт через 'name' app-signal
+        cameraStream: null,
+        emittedCamera: false,
+      };
+      this.peers.set(peerId, entry);
+      try {
+        this.events.onPeerJoined(peerId, entry.name);
+      } catch (err) { this.reportError(err, 'onPeerJoined'); }
+
+      // Точечно отправим этому peer'у наше display name + текущее media state.
+      // Так каждый peer узнаёт friendly name остальных и видит mute-индикаторы.
+      this.sendAppSignal(peerId, { kind: 'name', data: this.displayName });
+      this.sendAppSignal(peerId, { kind: 'media', data: this.localMediaState });
+    } else if (sessionId && entry.sessionId !== sessionId) {
+      entry.sessionId = sessionId;
+    }
+
+    // Если у peer'а уже есть sessionId — поставим в очередь pull его tracks.
+    if (entry.sessionId) this.queuePull(peerId);
+  }
+
+  private handlePeerLeft(peerId: string): void {
+    const entry = this.peers.get(peerId);
+    if (!entry) return;
+    this.peers.delete(peerId);
+    // Чистим mid-маппинги (важно чтобы при следующем pull mid'ы не путались).
+    const mids = this.peerToMids.get(peerId);
+    if (mids) {
+      for (const mid of mids) this.midToPeer.delete(mid);
+      this.peerToMids.delete(peerId);
+    }
+    try {
+      this.events.onPeerLeft(peerId);
+    } catch (err) { this.reportError(err, 'onPeerLeft'); }
+  }
+
+  private handleAppSignal(fromPeerId: string, payload: AppSignalEnvelope): void {
+    const entry = this.peers.get(fromPeerId);
+    if (!entry) return;
+    switch (payload.kind) {
+      case 'name': {
+        const name = typeof payload.data === 'string' ? payload.data.slice(0, 64) : '';
+        if (name) {
+          entry.name = name;
+          try {
+            // Перевыпускаем onPeerJoined — UI обновит имя над tile'ом.
+            this.events.onPeerJoined(fromPeerId, name);
+          } catch (err) { this.reportError(err, 'onPeerJoined(name)'); }
+        }
+        break;
+      }
+      case 'media': {
+        const d = payload.data as P2PMediaState | undefined;
+        if (d && typeof d.cam === 'boolean' && typeof d.mic === 'boolean') {
+          try {
+            this.events.onPeerMediaState?.(fromPeerId, { cam: d.cam, mic: d.mic });
+          } catch (err) { this.reportError(err, 'onPeerMediaState'); }
+        }
+        break;
+      }
+      case 'chat': {
+        const m = payload.data as ChatMessage | undefined;
+        if (m && typeof m.id === 'string' && typeof m.text === 'string') {
+          const safe: ChatMessage = {
+            id: m.id.slice(0, 64),
+            text: m.text.slice(0, 2000),
+            ts: typeof m.ts === 'number' ? m.ts : Date.now(),
+            fromName: typeof m.fromName === 'string' ? m.fromName.slice(0, 64) : entry.name,
+          };
+          try { this.events.onChatMessage?.(fromPeerId, safe); }
+          catch (err) { this.reportError(err, 'onChatMessage'); }
+        }
+        break;
+      }
+      case 'reaction': {
+        const r = payload.data as ReactionPayload | undefined;
+        if (r && typeof r.emoji === 'string') {
+          const safe: ReactionPayload = {
+            emoji: r.emoji.slice(0, 12),
+            ts: typeof r.ts === 'number' ? r.ts : Date.now(),
+            fromName: typeof r.fromName === 'string' ? r.fromName.slice(0, 64) : entry.name,
+          };
+          try { this.events.onReaction?.(fromPeerId, safe); }
+          catch (err) { this.reportError(err, 'onReaction'); }
+        }
+        break;
+      }
+      case 'gif-reaction': {
+        const g = payload.data as GifReactionPayload | undefined;
+        if (g && typeof g.url === 'string' && g.url.startsWith('https://') && g.url.length < 2000) {
+          const safe: GifReactionPayload = {
+            url: g.url,
+            width: clampDim(g.width),
+            height: clampDim(g.height),
+            ts: typeof g.ts === 'number' ? g.ts : Date.now(),
+            fromName: typeof g.fromName === 'string' ? g.fromName.slice(0, 64) : entry.name,
+          };
+          try { this.events.onGifReaction?.(fromPeerId, safe); }
+          catch (err) { this.reportError(err, 'onGifReaction'); }
+        }
+        break;
+      }
+    }
+  }
+
+  // ─── CF SFU: publish own tracks ───────────────────────────────────────────
+
+  private async setupPCAndPublish(localStream: MediaStream): Promise<void> {
+    const pc = new RTCPeerConnection(PC_CONFIG);
+    this.pc = pc;
+
+    pc.addEventListener('track', (event) => this.handleRemoteTrack(event));
+
+    pc.addEventListener('connectionstatechange', () => {
+      console.info('[zubrameet/cf-sfu] pc state:', pc.connectionState);
+    });
+
+    // Add local tracks как sendonly transceivers. mid'ы получим после createOffer.
+    const audioTrack = localStream.getAudioTracks()[0];
+    const videoTrack = localStream.getVideoTracks()[0];
+    const audioTrx = audioTrack
+      ? pc.addTransceiver(audioTrack, { direction: 'sendonly', streams: [localStream] })
+      : null;
+    const videoTrx = videoTrack
+      ? pc.addTransceiver(videoTrack, { direction: 'sendonly', streams: [localStream] })
+      : null;
+
+    // Шаг 1: создать пустую сессию.
+    const sessionRes = await fetch(`${SFU_API_BASE}/sessions/new`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    if (!sessionRes.ok) {
+      throw new Error(`sessions/new failed: ${sessionRes.status} ${await sessionRes.text()}`);
+    }
+    const sessionData = (await sessionRes.json()) as { sessionId?: string };
+    if (!sessionData.sessionId) throw new Error('sessions/new: no sessionId');
+    this.sessionId = sessionData.sessionId;
+    console.info('[zubrameet/cf-sfu] session created:', this.sessionId);
+
+    // Шаг 2: offer + tracks/new (publish).
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await iceGatheringComplete(pc, 3000);
+
+    const tracks: Array<{ location: 'local'; mid: string; trackName: string }> = [];
+    if (audioTrx?.mid) tracks.push({ location: 'local', mid: audioTrx.mid, trackName: TRACK_MIC });
+    if (videoTrx?.mid) tracks.push({ location: 'local', mid: videoTrx.mid, trackName: TRACK_CAMERA });
+
+    const tracksRes = await fetch(
+      `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionDescription: pc.localDescription,
+          tracks,
+        }),
+      },
+    );
+    if (!tracksRes.ok) {
+      throw new Error(`tracks/new (publish) failed: ${tracksRes.status} ${await tracksRes.text()}`);
+    }
+    const tracksData = (await tracksRes.json()) as {
+      sessionDescription: RTCSessionDescriptionInit;
+    };
+    await pc.setRemoteDescription(tracksData.sessionDescription);
+    console.info('[zubrameet/cf-sfu] published local tracks');
+  }
+
+  // ─── CF SFU: pull peer tracks ─────────────────────────────────────────────
+
+  private queuePull(peerId: string): void {
+    this.pullQueue.add(peerId);
+    if (this.pullTimer !== null) return;
+    // Дебаунс — если несколько peer'ов появились один за другим, сделаем один
+    // батчевый pull. 100ms — компромисс между batching-эффектом и UX-задержкой.
+    this.pullTimer = window.setTimeout(() => {
+      this.pullTimer = null;
+      const queued = Array.from(this.pullQueue);
+      this.pullQueue.clear();
+      void this.runPull(queued);
+    }, 100);
+  }
+
+  private async runPull(peerIds: string[]): Promise<void> {
+    // Сериализуем negotiation — параллельные SDP-операции на одном PC ломают state.
+    const prev = this.negotiationLock;
+    let release!: () => void;
+    this.negotiationLock = new Promise<void>((res) => { release = res; });
+    await prev;
+    try {
+      await this.pullTracksImpl(peerIds);
+    } catch (err) {
+      this.reportError(err, 'runPull');
+    } finally {
+      release();
+    }
+  }
+
+  private async pullTracksImpl(peerIds: string[]): Promise<void> {
+    if (!this.pc || !this.sessionId || this.closed) return;
+
+    // Собираем list remote-tracks, попутно запоминая порядок чтобы потом
+    // смаппить ответ обратно на peerId.
+    const requestTracks: Array<{ location: 'remote'; sessionId: string; trackName: string }> = [];
+    const order: Array<{ peerId: string; kind: RemoteStreamKind; trackName: string }> = [];
+    for (const pid of peerIds) {
+      const peer = this.peers.get(pid);
+      if (!peer || !peer.sessionId) continue;
+      requestTracks.push({ location: 'remote', sessionId: peer.sessionId, trackName: TRACK_MIC });
+      order.push({ peerId: pid, kind: 'camera', trackName: TRACK_MIC });
+      requestTracks.push({ location: 'remote', sessionId: peer.sessionId, trackName: TRACK_CAMERA });
+      order.push({ peerId: pid, kind: 'camera', trackName: TRACK_CAMERA });
+    }
+    if (requestTracks.length === 0) return;
+
+    const res = await fetch(
+      `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tracks: requestTracks }),
+      },
+    );
+    if (!res.ok) {
+      throw new Error(`tracks/new (pull) failed: ${res.status} ${await res.text()}`);
+    }
+    const data = (await res.json()) as {
+      requiresImmediateRenegotiation?: boolean;
+      sessionDescription?: RTCSessionDescriptionInit;
+      tracks?: Array<{ mid?: string; trackName?: string }>;
+    };
+
+    // Маппим ответ tracks → (peerId, kind). CF возвращает их в том же порядке
+    // что и request, согласно docs. mid'ы в ответе соответствуют новым
+    // recvonly transceiver'ам, которые CF создал в своём offer'е (приходит
+    // с requiresImmediateRenegotiation).
+    if (data.tracks && data.tracks.length === order.length) {
+      for (let i = 0; i < data.tracks.length; i++) {
+        const mid = data.tracks[i].mid;
+        if (typeof mid !== 'string') continue;
+        const meta = order[i];
+        this.midToPeer.set(mid, meta);
+        let mids = this.peerToMids.get(meta.peerId);
+        if (!mids) {
+          mids = new Set();
+          this.peerToMids.set(meta.peerId, mids);
+        }
+        mids.add(mid);
+      }
+    }
+
+    if (data.requiresImmediateRenegotiation && data.sessionDescription) {
+      await this.pc.setRemoteDescription(data.sessionDescription);
+      const answer = await this.pc.createAnswer();
+      await this.pc.setLocalDescription(answer);
+      const renegotiateRes = await fetch(
+        `${SFU_API_BASE}/sessions/${this.sessionId}/renegotiate`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionDescription: this.pc.localDescription }),
+        },
+      );
+      if (!renegotiateRes.ok) {
+        throw new Error(`renegotiate failed: ${renegotiateRes.status} ${await renegotiateRes.text()}`);
+      }
+      console.info('[zubrameet/cf-sfu] renegotiated for', peerIds.length, 'peer(s)');
+    }
+  }
+
+  private handleRemoteTrack(event: RTCTrackEvent): void {
+    const mid = event.transceiver.mid;
+    if (!mid) {
+      console.warn('[zubrameet/cf-sfu] remote track has no mid, skipping');
+      return;
+    }
+    const meta = this.midToPeer.get(mid);
+    if (!meta) {
+      // mid не маппится — track пришёл раньше чем мы успели сохранить mapping.
+      // Маловероятно (мы сохраняем до setRemoteDescription), но безопасно warn.
+      console.warn('[zubrameet/cf-sfu] no mapping for mid', mid);
+      return;
+    }
+    const peer = this.peers.get(meta.peerId);
+    if (!peer) {
+      console.warn('[zubrameet/cf-sfu] track for unknown peer', meta.peerId);
+      return;
+    }
+
+    // Аггрегируем audio + video одного peer'а в один MediaStream — UI ожидает
+    // именно так (один <video> с обоими треками).
+    if (!peer.cameraStream) {
+      peer.cameraStream = new MediaStream();
+    }
+    peer.cameraStream.addTrack(event.track);
+
+    if (!peer.emittedCamera) {
+      peer.emittedCamera = true;
+      try {
+        this.events.onRemoteStream(peer.peerId, peer.cameraStream, peer.name, 'camera');
+      } catch (err) { this.reportError(err, 'onRemoteStream'); }
+    }
+  }
+
+  // ─── public API: chat/reactions/media-state ───────────────────────────────
+
+  setMediaState(state: P2PMediaState): void {
+    this.localMediaState = { cam: state.cam, mic: state.mic };
+    this.broadcastAppSignal({ kind: 'media', data: this.localMediaState });
+  }
+
+  sendChatMessage(text: string): void {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return;
+    const msg: ChatMessage = {
+      id: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      text: trimmed.slice(0, 2000),
+      ts: Date.now(),
+      fromName: this.displayName,
+    };
+    this.broadcastAppSignal({ kind: 'chat', data: msg });
+    try { this.events.onChatMessage?.('self', msg); }
+    catch (err) { this.reportError(err, 'onChatMessage(self)'); }
+  }
+
+  sendReaction(emoji: string): void {
+    const trimmed = emoji.trim();
+    if (trimmed.length === 0) return;
+    const payload: ReactionPayload = {
+      emoji: trimmed.slice(0, 12),
+      ts: Date.now(),
+      fromName: this.displayName,
+    };
+    this.broadcastAppSignal({ kind: 'reaction', data: payload });
+    try { this.events.onReaction?.('self', payload); }
+    catch (err) { this.reportError(err, 'onReaction(self)'); }
+  }
+
+  sendGifReaction(url: string, width: number, height: number): void {
+    if (typeof url !== 'string' || !url.startsWith('https://') || url.length > 2000) return;
+    const payload: GifReactionPayload = {
+      url,
+      width: clampDim(width),
+      height: clampDim(height),
+      ts: Date.now(),
+      fromName: this.displayName,
+    };
+    this.broadcastAppSignal({ kind: 'gif-reaction', data: payload });
+    try { this.events.onGifReaction?.('self', payload); }
+    catch (err) { this.reportError(err, 'onGifReaction(self)'); }
+  }
+
+  // ─── stubs (для API-совместимости с P2PMeetConnection) ────────────────────
+
+  // Screen share в CF SFU режиме пока не реализован — нужен отдельный publish
+  // дополнительного track'а через tracks/new + propagate screen-state.
+  // Будет добавлено в следующей итерации, после подтверждения что базовый
+  // video/audio path работает.
+
+  async startScreenShare(_quality: ScreenQuality = DEFAULT_SCREEN_QUALITY): Promise<MediaStream> {
+    throw new Error('screen share не поддерживается в CF SFU режиме (пока)');
+  }
+
+  async stopScreenShare(): Promise<void> {
+    /* no-op */
+  }
+
+  // ─── private ──────────────────────────────────────────────────────────────
+
+  private reportError(err: unknown, ctx: string): void {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[zubrameet/cf-sfu] ${ctx}: ${msg}`);
+    try {
+      this.events.onError(new Error(`cf-sfu[${ctx}]: ${msg}`));
+    } catch { /* swallow */ }
+  }
+}
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+function generatePeerId(): string {
+  // 16 hex chars — достаточно для уникальности в комнате.
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function clampDim(n: unknown): number {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return 240;
+  if (n > 4096) return 4096;
+  return Math.round(n);
+}
+
+// CF Realtime API ожидает полный SDP без trickle ICE — т.е. мы должны
+// дождаться завершения ICE-gathering перед отправкой offer'а. Возвращает
+// promise который резолвится при iceGatheringState='complete' или по таймауту
+// (если gathering зависнет — отправим то что собрали).
+function iceGatheringComplete(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (pc.iceGatheringState === 'complete') {
+      resolve();
+      return;
+    }
+    let done = false;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      pc.removeEventListener('icegatheringstatechange', onChange);
+      window.clearTimeout(t);
+      resolve();
+    };
+    const onChange = () => {
+      if (pc.iceGatheringState === 'complete') cleanup();
+    };
+    pc.addEventListener('icegatheringstatechange', onChange);
+    const t = window.setTimeout(cleanup, timeoutMs);
+  });
+}
