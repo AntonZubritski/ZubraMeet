@@ -1,9 +1,18 @@
 // P2P-режим. Зеркалит интерфейс MeetConnection, но вместо SFU/WS-сигналинга
-// использует Trystero — mesh-WebRTC + Nostr-relays для signaling.
+// использует Trystero — mesh-WebRTC + публичные MQTT-брокеры для signaling.
 //
 // Topology: full mesh. Каждый клиент держит RTCPeerConnection ко ВСЕМ остальным.
 // Подходит для маленьких комнат (≤6–8 человек) и хостов за CGNAT, у которых
 // нет публичного IP/IPv6/UPnP для SFU.
+//
+// Почему MQTT, а не Nostr (дефолт Trystero v0.24): на практике публичные Nostr-
+// relay'и оказались совершенно непригодны для WebRTC-signaling — половина
+// требует web-of-trust pubkey ('Policy violated' от offchain.pub/bitcoiner.social),
+// другая rate-limit'ит уже через 5-10 events ('you are noting too much' от
+// damus.io), а WebRTC handshake генерит 20+ events (offer/answer + ICE-candidates).
+// Без overlap живых relay'ев у обоих сторон peers молча не находят друг друга.
+// Публичные MQTT-брокеры (mosquitto/EMQX/HiveMQ) исторически принимают анонимный
+// pub-sub трафик без regs и без жёстких лимитов.
 //
 // Отличия от SignalClient+MeetConnection:
 // - нет своего WebSocket-сервера
@@ -14,7 +23,7 @@
 // третий аргумент в Trystero — metadata, передаётся приёмнику в onPeerStream
 // третьим аргументом. По нему различаем camera vs screen.
 
-import { joinRoom, type Room, type ActionSender } from 'trystero';
+import { joinRoom, type Room, type ActionSender } from '@trystero-p2p/mqtt';
 import { PUBLIC_ICE_SERVERS } from './ice';
 import {
   DEFAULT_SCREEN_QUALITY,
@@ -227,52 +236,26 @@ export class P2PMeetConnection {
         // и data-channel сообщения. Peer без правильного password не сможет
         // расшифровать SDP/ICE → peer-connection не установится.
         //
-        // relayConfig.urls: явный список стабильных публичных Nostr-relay'ев.
-        // ВАЖНО: имя поля именно `relayConfig.urls`, а не `relayUrls` — Trystero
-        // v0.24 читает только этот ключ (см. node_modules/trystero/README.md и
-        // @trystero-p2p/core/utils.mjs:getRelays). Если передать `relayUrls` —
-        // оно молча игнорируется, и Trystero берёт дефолтные ~50 relay'ев,
-        // детерминистически шафлит по appId и оставляет первые 5. Среди этих
-        // 5 для appId='zubrameet' попадает relay.nostr.place с жёстким
-        // rate-limit'ом ("you are noting too much"), из-за чего peer'ы не
-        // находят друг друга. Поэтому передаём свой список через корректный ключ.
+        // relayConfig не передаём — @trystero-p2p/mqtt идёт со встроенным
+        // дефолтным списком из 5 публичных MQTT-брокеров (mosquitto, EMQX,
+        // HiveMQ, shiftr.io). Они исторически принимают анонимный pub/sub
+        // трафик без регистрации и без жёстких rate-limit'ов; для WebRTC-
+        // signaling этого хватает. Если в будущем какой-то broker отвалится —
+        // можно будет передать свой `relayConfig: { urls: [...] }`.
         const config: {
           appId: string;
           rtcConfig: { iceServers: typeof PUBLIC_ICE_SERVERS };
           password?: string;
-          relayConfig: { urls: string[] };
         } = {
           appId: APP_ID,
           rtcConfig: { iceServers: PUBLIC_ICE_SERVERS },
-          relayConfig: {
-            // Список подбирался эмпирически. Исключены:
-            //   - relay.damus.io      → rate-limit "you are noting too much"
-            //                           уже на 5-10 events (нам нужно ≥20 за handshake)
-            //   - nostr.wine          → restricted, требует регистрации/payment
-            //   - relay.snort.social  → WebSocket падает (мёртв)
-            //   - relay.nostr.band    → WebSocket падает (мёртв)
-            //   - relay.nostr.place   → жёсткий rate-limit (был дефолтом Trystero)
-            // Оставлены/добавлены write-friendly публичные relay'и без regs.
-            // Trystero шлёт EVENT параллельно на ВСЕ relay'и — peer'ы увидят
-            // друг друга если хотя бы один общий relay доставил сообщение.
-            urls: [
-              'wss://nos.lol',
-              'wss://relay.primal.net',
-              'wss://nostr-pub.wellorder.net',
-              'wss://relay.nostr.bg',
-              'wss://nostr.mom',
-              'wss://offchain.pub',
-              'wss://nostr.bitcoiner.social',
-              'wss://relay.nostriches.org',
-            ],
-          },
         };
         if (this.password) {
           config.password = this.password;
         }
         room = joinRoom(config, this.roomId);
         console.info(
-          '[zubrameet/p2p] joined room via Trystero/Nostr',
+          '[zubrameet/p2p] joined room via Trystero/MQTT',
           this.password ? '(E2EE)' : '(no password)',
         );
       } catch (err) {

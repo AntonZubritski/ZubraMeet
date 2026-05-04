@@ -10,6 +10,7 @@
     "typecheck": "tsc -b --noEmit"
   },
   "dependencies": {
+    "@trystero-p2p/mqtt": "^0.24.0",
     "boring-avatars": "^2.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
