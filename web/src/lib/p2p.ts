@@ -227,27 +227,33 @@ export class P2PMeetConnection {
         // и data-channel сообщения. Peer без правильного password не сможет
         // расшифровать SDP/ICE → peer-connection не установится.
         //
-        // relayUrls: явный список стабильных публичных Nostr-relay'ев. Default
-        // у Trystero включает relay.nostr.place у которого жёсткий rate-limit
-        // ("you are noting too much") — peer'ы НЕ находят друг друга если
-        // оба попадают на этот relay. Передаём свой список из давно работающих
-        // и распределённых nodes — увеличивает шанс что хотя бы один доступен.
+        // relayConfig.urls: явный список стабильных публичных Nostr-relay'ев.
+        // ВАЖНО: имя поля именно `relayConfig.urls`, а не `relayUrls` — Trystero
+        // v0.24 читает только этот ключ (см. node_modules/trystero/README.md и
+        // @trystero-p2p/core/utils.mjs:getRelays). Если передать `relayUrls` —
+        // оно молча игнорируется, и Trystero берёт дефолтные ~50 relay'ев,
+        // детерминистически шафлит по appId и оставляет первые 5. Среди этих
+        // 5 для appId='zubrameet' попадает relay.nostr.place с жёстким
+        // rate-limit'ом ("you are noting too much"), из-за чего peer'ы не
+        // находят друг друга. Поэтому передаём свой список через корректный ключ.
         const config: {
           appId: string;
           rtcConfig: { iceServers: typeof PUBLIC_ICE_SERVERS };
           password?: string;
-          relayUrls?: string[];
+          relayConfig: { urls: string[] };
         } = {
           appId: APP_ID,
           rtcConfig: { iceServers: PUBLIC_ICE_SERVERS },
-          relayUrls: [
-            'wss://relay.damus.io',
-            'wss://nos.lol',
-            'wss://nostr.wine',
-            'wss://relay.nostr.band',
-            'wss://relay.snort.social',
-            'wss://relay.primal.net',
-          ],
+          relayConfig: {
+            urls: [
+              'wss://relay.damus.io',
+              'wss://nos.lol',
+              'wss://nostr.wine',
+              'wss://relay.nostr.band',
+              'wss://relay.snort.social',
+              'wss://relay.primal.net',
+            ],
+          },
         };
         if (this.password) {
           config.password = this.password;
