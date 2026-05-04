@@ -29,7 +29,7 @@ import {
   type Room,
   type ActionSender,
 } from '@trystero-p2p/mqtt';
-import { PUBLIC_ICE_SERVERS } from './ice';
+import { getIceServers } from './ice';
 import {
   DEFAULT_SCREEN_QUALITY,
   getScreenQualityPreset,
@@ -233,13 +233,20 @@ export class P2PMeetConnection {
         this.reportError(err, 'onLocalStream');
       }
 
+      // ICE-config грузим до joinRoom — Trystero pre-warm'ит RTCPeerConnection
+      // в OfferPool сразу после init, и без TURN там окажется только STUN.
+      // Сетевой fetch к Worker'у — типично 100-300ms, для UX незаметно.
+      const iceServers = await getIceServers();
+
       let room: Room;
       try {
-        // rtcConfig: бесплатные публичные STUN+TURN из ice.ts. TURN критичен
-        // для symmetric NAT (≈15–20% сетей), без него P2P-mesh не пробьётся.
-        // password (если задан): Trystero шифрует ВЁС signaling через Nostr-relays
-        // и data-channel сообщения. Peer без правильного password не сможет
-        // расшифровать SDP/ICE → peer-connection не установится.
+        // rtcConfig: STUN + Cloudflare Realtime TURN с короткоживущими
+        // credentials (выдаёт наш Worker). TURN критичен для symmetric NAT
+        // (~15-20% сетей, типично два домашних клиента в разных странах за
+        // CGNAT), без него P2P-mesh не пробьётся.
+        // password (если задан): Trystero шифрует ВЁС signaling через MQTT
+        // brokers и data-channel сообщения. Peer без правильного password
+        // не сможет расшифровать SDP/ICE → peer-connection не установится.
         //
         // relayConfig.urls: явно перечисляем ВСЕ 5 встроенных публичных
         // MQTT-брокеров. По умолчанию Trystero/mqtt берёт первые 4
@@ -251,12 +258,12 @@ export class P2PMeetConnection {
         // достаточно для discovery.
         const config: {
           appId: string;
-          rtcConfig: { iceServers: typeof PUBLIC_ICE_SERVERS };
+          rtcConfig: { iceServers: RTCIceServer[] };
           password?: string;
           relayConfig: { urls: string[] };
         } = {
           appId: APP_ID,
-          rtcConfig: { iceServers: PUBLIC_ICE_SERVERS },
+          rtcConfig: { iceServers },
           relayConfig: {
             urls: [
               'wss://broker.hivemq.com:8884/mqtt',
@@ -307,7 +314,7 @@ export class P2PMeetConnection {
         // peer-connection с собеседником за symmetric NAT не пробьётся.
         // Это типичный сценарий для двух домашних клиентов в разных странах.
         try {
-          const probe = new RTCPeerConnection({ iceServers: PUBLIC_ICE_SERVERS });
+          const probe = new RTCPeerConnection({ iceServers });
           // DataChannel нужен чтобы ICE gathering вообще начался.
           probe.createDataChannel('ice-test');
           const found: { host: number; srflx: number; relay: number; prflx: number } = {

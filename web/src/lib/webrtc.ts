@@ -1,5 +1,5 @@
 import { SignalClient } from './signal';
-import { PUBLIC_ICE_SERVERS } from './ice';
+import { FALLBACK_ICE_SERVERS } from './ice';
 import {
   DEFAULT_SCREEN_QUALITY,
   getScreenQualityPreset,
@@ -35,7 +35,11 @@ interface StatsSnapshot {
   packetsReceived: number;
 }
 
-const DEFAULT_ICE_SERVERS: RTCIceServer[] = PUBLIC_ICE_SERVERS;
+// SFU-режим: caller (Meeting.tsx) при желании передаёт уже загруженный набор
+// (await getIceServers()). Если не передаст — используем STUN-only fallback.
+// Для production-SFU Meeting.tsx должен явно подгружать TURN-credentials через
+// getIceServers() и передавать в конструктор.
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = FALLBACK_ICE_SERVERS;
 
 const RECONNECT_MAX_ATTEMPTS = 5;
 const RECONNECT_BACKOFFS_MS = [1000, 2000, 4000, 8000, 8000];
