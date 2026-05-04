@@ -245,13 +245,25 @@ export class P2PMeetConnection {
           appId: APP_ID,
           rtcConfig: { iceServers: PUBLIC_ICE_SERVERS },
           relayConfig: {
+            // Список подбирался эмпирически. Исключены:
+            //   - relay.damus.io      → rate-limit "you are noting too much"
+            //                           уже на 5-10 events (нам нужно ≥20 за handshake)
+            //   - nostr.wine          → restricted, требует регистрации/payment
+            //   - relay.snort.social  → WebSocket падает (мёртв)
+            //   - relay.nostr.band    → WebSocket падает (мёртв)
+            //   - relay.nostr.place   → жёсткий rate-limit (был дефолтом Trystero)
+            // Оставлены/добавлены write-friendly публичные relay'и без regs.
+            // Trystero шлёт EVENT параллельно на ВСЕ relay'и — peer'ы увидят
+            // друг друга если хотя бы один общий relay доставил сообщение.
             urls: [
-              'wss://relay.damus.io',
               'wss://nos.lol',
-              'wss://nostr.wine',
-              'wss://relay.nostr.band',
-              'wss://relay.snort.social',
               'wss://relay.primal.net',
+              'wss://nostr-pub.wellorder.net',
+              'wss://relay.nostr.bg',
+              'wss://nostr.mom',
+              'wss://offchain.pub',
+              'wss://nostr.bitcoiner.social',
+              'wss://relay.nostriches.org',
             ],
           },
         };
