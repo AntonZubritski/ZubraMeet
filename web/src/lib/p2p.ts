@@ -299,6 +299,60 @@ export class P2PMeetConnection {
         // handshake), потом каждые 10 сек пока кто-то не приконнектится.
         window.setTimeout(dumpRelayHealth, 3000);
         window.setTimeout(dumpRelayHealth, 10000);
+
+        // ICE-самотест: создаём временный RTCPeerConnection с тем же ICE-config
+        // что у Trystero и собираем candidate'ы. Цель — увидеть смог ли наш
+        // браузер достучаться до TURN-сервера (`typ relay`). Если только
+        // `typ host` (LAN) и `typ srflx` (STUN) — значит TURN недоступен, и
+        // peer-connection с собеседником за symmetric NAT не пробьётся.
+        // Это типичный сценарий для двух домашних клиентов в разных странах.
+        try {
+          const probe = new RTCPeerConnection({ iceServers: PUBLIC_ICE_SERVERS });
+          // DataChannel нужен чтобы ICE gathering вообще начался.
+          probe.createDataChannel('ice-test');
+          const found: { host: number; srflx: number; relay: number; prflx: number } = {
+            host: 0,
+            srflx: 0,
+            relay: 0,
+            prflx: 0,
+          };
+          const relayCandidates: string[] = [];
+          probe.onicecandidate = (e) => {
+            if (!e.candidate) {
+              const verdict = found.relay > 0
+                ? `OK — TURN reachable (${found.relay} relay candidates)`
+                : 'FAIL — no TURN relay candidates; P2P with symmetric-NAT peers will not connect';
+              console.info(
+                `[zubrameet/ice-test] ${verdict}\n` +
+                `  host=${found.host} srflx=${found.srflx} relay=${found.relay} prflx=${found.prflx}` +
+                (relayCandidates.length > 0 ? '\n  relay sample: ' + relayCandidates[0] : ''),
+              );
+              try { probe.close(); } catch { /* ignore */ }
+              return;
+            }
+            const c = e.candidate.candidate;
+            if (c.includes(' typ host')) found.host++;
+            else if (c.includes(' typ srflx')) found.srflx++;
+            else if (c.includes(' typ relay')) {
+              found.relay++;
+              relayCandidates.push(c);
+            }
+            else if (c.includes(' typ prflx')) found.prflx++;
+          };
+          // На всякий случай safety-cap — если gathering зависнет.
+          window.setTimeout(() => {
+            if (probe.iceGatheringState !== 'complete') {
+              console.warn(
+                `[zubrameet/ice-test] timeout — gatheringState=${probe.iceGatheringState}, ` +
+                `host=${found.host} srflx=${found.srflx} relay=${found.relay}`,
+              );
+              try { probe.close(); } catch { /* ignore */ }
+            }
+          }, 8000);
+          void probe.createOffer().then((offer) => probe.setLocalDescription(offer));
+        } catch (err) {
+          console.warn('[zubrameet/ice-test] failed to start probe', err);
+        }
       } catch (err) {
         this.reportError(err, 'joinRoom');
         return;
