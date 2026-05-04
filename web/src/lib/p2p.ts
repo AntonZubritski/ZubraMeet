@@ -23,12 +23,7 @@
 // третий аргумент в Trystero — metadata, передаётся приёмнику в onPeerStream
 // третьим аргументом. По нему различаем camera vs screen.
 
-import {
-  joinRoom,
-  getRelaySockets,
-  type Room,
-  type ActionSender,
-} from '@trystero-p2p/mqtt';
+import { joinRoom, type Room, type ActionSender } from '@trystero-p2p/mqtt';
 import { getIceServers } from './ice';
 import {
   DEFAULT_SCREEN_QUALITY,
@@ -248,14 +243,14 @@ export class P2PMeetConnection {
         // brokers и data-channel сообщения. Peer без правильного password
         // не сможет расшифровать SDP/ICE → peer-connection не установится.
         //
-        // relayConfig.urls: явно перечисляем ВСЕ 5 встроенных публичных
-        // MQTT-брокеров. По умолчанию Trystero/mqtt берёт первые 4
-        // (defaultRedundancy=4) — broker.hivemq.com (5-й в списке) выпадает.
-        // А mosquitto:8081/mqtt (1-й) часто вообще не отвечает по WSS, так что
-        // дефолтный slice может оставить юзера фактически без brokers.
-        // Передаём весь набор — Trystero использует список целиком (без slice
-        // когда .urls задан), и подключение к любому общему живому broker'у
-        // достаточно для discovery.
+        // relayConfig.urls: тщательно подобранный список MQTT-брокеров для
+        // быстрой дискавери peer'ов. Из дефолтного списка Trystero исключены:
+        //   - test.mosquitto.org:8081/mqtt — стабильно не отвечает по WSS
+        //     (постоянный reconnect-loop, забивает сеть и отъедает время на старте)
+        //   - broker-cn.emqx.io:8084/mqtt — Китай, +150ms latency на каждое
+        //     сообщение для пользователей из EU/UA/RU/BY, замедляет discovery
+        // Оставлены 3 broker'а с низкой латентностью из EU/US — этого с запасом
+        // хватает для overlap-discovery даже если один из них временно отвалится.
         const config: {
           appId: string;
           rtcConfig: { iceServers: RTCIceServer[] };
@@ -268,8 +263,6 @@ export class P2PMeetConnection {
             urls: [
               'wss://broker.hivemq.com:8884/mqtt',
               'wss://broker.emqx.io:8084/mqtt',
-              'wss://broker-cn.emqx.io:8084/mqtt',
-              'wss://test.mosquitto.org:8081/mqtt',
               'wss://public:public@public.cloud.shiftr.io',
             ],
           },
@@ -282,84 +275,6 @@ export class P2PMeetConnection {
           '[zubrameet/p2p] joined room via Trystero/MQTT',
           this.password ? '(E2EE)' : '(no password)',
         );
-
-        // Диагностика: периодически логируем состояние WebSocket-соединений
-        // ко всем MQTT-broker'ам. Trystero сам не сообщает каких relay'ев он
-        // подцепил живыми, и пока хотя бы один общий broker не работает у
-        // обоих peer'ов — discovery молча не сработает. Этот лог даёт нам
-        // явную картину «вот что у меня живо».
-        // 1=CONNECTING, 2=OPEN, 3=CLOSING, 4=CLOSED
-        const dumpRelayHealth = () => {
-          try {
-            const sockets = getRelaySockets() as Record<string, WebSocket>;
-            const lines: string[] = [];
-            for (const [url, ws] of Object.entries(sockets)) {
-              const state = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState] ?? `?${ws.readyState}`;
-              lines.push(`  ${state.padEnd(10)} ${url}`);
-            }
-            console.info('[zubrameet/p2p] relay health:\n' + lines.join('\n'));
-          } catch (err) {
-            console.warn('[zubrameet/p2p] relay health probe failed', err);
-          }
-        };
-        // Первая проверка после короткой задержки (broker'ам нужно время на
-        // handshake), потом каждые 10 сек пока кто-то не приконнектится.
-        window.setTimeout(dumpRelayHealth, 3000);
-        window.setTimeout(dumpRelayHealth, 10000);
-
-        // ICE-самотест: создаём временный RTCPeerConnection с тем же ICE-config
-        // что у Trystero и собираем candidate'ы. Цель — увидеть смог ли наш
-        // браузер достучаться до TURN-сервера (`typ relay`). Если только
-        // `typ host` (LAN) и `typ srflx` (STUN) — значит TURN недоступен, и
-        // peer-connection с собеседником за symmetric NAT не пробьётся.
-        // Это типичный сценарий для двух домашних клиентов в разных странах.
-        try {
-          const probe = new RTCPeerConnection({ iceServers });
-          // DataChannel нужен чтобы ICE gathering вообще начался.
-          probe.createDataChannel('ice-test');
-          const found: { host: number; srflx: number; relay: number; prflx: number } = {
-            host: 0,
-            srflx: 0,
-            relay: 0,
-            prflx: 0,
-          };
-          const relayCandidates: string[] = [];
-          probe.onicecandidate = (e) => {
-            if (!e.candidate) {
-              const verdict = found.relay > 0
-                ? `OK — TURN reachable (${found.relay} relay candidates)`
-                : 'FAIL — no TURN relay candidates; P2P with symmetric-NAT peers will not connect';
-              console.info(
-                `[zubrameet/ice-test] ${verdict}\n` +
-                `  host=${found.host} srflx=${found.srflx} relay=${found.relay} prflx=${found.prflx}` +
-                (relayCandidates.length > 0 ? '\n  relay sample: ' + relayCandidates[0] : ''),
-              );
-              try { probe.close(); } catch { /* ignore */ }
-              return;
-            }
-            const c = e.candidate.candidate;
-            if (c.includes(' typ host')) found.host++;
-            else if (c.includes(' typ srflx')) found.srflx++;
-            else if (c.includes(' typ relay')) {
-              found.relay++;
-              relayCandidates.push(c);
-            }
-            else if (c.includes(' typ prflx')) found.prflx++;
-          };
-          // На всякий случай safety-cap — если gathering зависнет.
-          window.setTimeout(() => {
-            if (probe.iceGatheringState !== 'complete') {
-              console.warn(
-                `[zubrameet/ice-test] timeout — gatheringState=${probe.iceGatheringState}, ` +
-                `host=${found.host} srflx=${found.srflx} relay=${found.relay}`,
-              );
-              try { probe.close(); } catch { /* ignore */ }
-            }
-          }, 8000);
-          void probe.createOffer().then((offer) => probe.setLocalDescription(offer));
-        } catch (err) {
-          console.warn('[zubrameet/ice-test] failed to start probe', err);
-        }
       } catch (err) {
         this.reportError(err, 'joinRoom');
         return;

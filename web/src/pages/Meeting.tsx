@@ -19,6 +19,7 @@ import { navigate } from '../App';
 import { SignalClient, buildWsUrl } from '../lib/signal';
 import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
 import { P2PMeetConnection, type P2PMeetEvents } from '../lib/p2p';
+import { getIceServers } from '../lib/ice';
 import {
   DEFAULT_SCREEN_QUALITY,
   type ScreenQuality,
@@ -788,6 +789,14 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         localStreamRef.current = null;
       }
     };
+
+    // Pre-warm: запускаем fetch TURN-credentials параллельно с getUserMedia.
+    // Браузер обычно тратит 100-500ms на разрешения камеры/микрофона
+    // (мгновенно если уже выданы) — пока пользователь подтверждает, наш
+    // CF Worker отдаст iceServers, и к моменту joinRoom внутри P2PMeetConnection
+    // вызов getIceServers() вернёт уже-resolved cached value без сетевой
+    // round-trip. Экономит ~300-500ms на старте мита.
+    void getIceServers();
 
     void (async () => {
       // 1. Камера/микрофон.
