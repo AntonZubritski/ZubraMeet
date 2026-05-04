@@ -418,38 +418,71 @@ export class CFSFUConnection {
       console.info('[zubrameet/cf-sfu] pc state:', pc.connectionState);
     });
 
-    // Add local tracks как sendonly transceivers. mid'ы получим после createOffer.
-    const audioTrack = localStream.getAudioTracks()[0];
-    const videoTrack = localStream.getVideoTracks()[0];
-    const audioTrx = audioTrack
-      ? pc.addTransceiver(audioTrack, { direction: 'sendonly', streams: [localStream] })
-      : null;
-    const videoTrx = videoTrack
-      ? pc.addTransceiver(videoTrack, { direction: 'sendonly', streams: [localStream] })
-      : null;
+    // CF Realtime API требует двух отдельных шагов:
+    //  1) POST /sessions/new — обязателен валидный SDP offer (CF использует
+    //     его только для setup ICE/DTLS-канала, media в нём игнорируется).
+    //     Возвращает sessionId + answer для setup'а PC.
+    //  2) POST /sessions/{id}/tracks/new — здесь уже подаётся offer С tracks
+    //     (sendonly transceivers) + явный список { location:'local', mid, trackName }.
+    //     CF принимает наши tracks и возвращает answer.
+    //
+    // Объединить в один запрос нельзя — sessions/new игнорирует media в SDP.
 
-    // Шаг 1: создать пустую сессию.
+    // Bootstrap-этап: создаём sendonly transceiver'ы (без real tracks пока),
+    // делаем минимальный offer, отправляем в sessions/new для получения sessionId.
+    pc.addTransceiver('audio', { direction: 'sendonly' });
+    pc.addTransceiver('video', { direction: 'sendonly' });
+
+    const bootstrapOffer = await pc.createOffer();
+    await pc.setLocalDescription(bootstrapOffer);
+    await iceGatheringComplete(pc, 3000);
+
     const sessionRes = await fetch(`${SFU_API_BASE}/sessions/new`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify({ sessionDescription: pc.localDescription }),
     });
     if (!sessionRes.ok) {
       throw new Error(`sessions/new failed: ${sessionRes.status} ${await sessionRes.text()}`);
     }
-    const sessionData = (await sessionRes.json()) as { sessionId?: string };
-    if (!sessionData.sessionId) throw new Error('sessions/new: no sessionId');
+    const sessionData = (await sessionRes.json()) as {
+      sessionId?: string;
+      sessionDescription?: RTCSessionDescriptionInit;
+    };
+    if (!sessionData.sessionId || !sessionData.sessionDescription) {
+      throw new Error('sessions/new: missing sessionId or sessionDescription');
+    }
     this.sessionId = sessionData.sessionId;
+    await pc.setRemoteDescription(sessionData.sessionDescription);
     console.info('[zubrameet/cf-sfu] session created:', this.sessionId);
 
-    // Шаг 2: offer + tracks/new (publish).
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await iceGatheringComplete(pc, 3000);
+    // Publish-этап: подменяем sendonly transceiver'ам real tracks от localStream
+    // через replaceTrack (это не требует renegotiation), потом снова делаем
+    // offer и шлём в tracks/new с явным mid+trackName маппингом.
+    const audioTrack = localStream.getAudioTracks()[0];
+    const videoTrack = localStream.getVideoTracks()[0];
+    const transceivers = pc.getTransceivers();
+    const audioTrx = transceivers.find((t) => t.sender.track === null && t.receiver.track?.kind === 'audio') ?? transceivers.find((t) => t.receiver.track?.kind === 'audio');
+    const videoTrx = transceivers.find((t) => t.sender.track === null && t.receiver.track?.kind === 'video') ?? transceivers.find((t) => t.receiver.track?.kind === 'video');
+
+    if (audioTrack && audioTrx) await audioTrx.sender.replaceTrack(audioTrack);
+    if (videoTrack && videoTrx) await videoTrx.sender.replaceTrack(videoTrack);
+
+    // Make offer уже с реальными tracks.
+    const publishOffer = await pc.createOffer();
+    await pc.setLocalDescription(publishOffer);
 
     const tracks: Array<{ location: 'local'; mid: string; trackName: string }> = [];
-    if (audioTrx?.mid) tracks.push({ location: 'local', mid: audioTrx.mid, trackName: TRACK_MIC });
-    if (videoTrx?.mid) tracks.push({ location: 'local', mid: videoTrx.mid, trackName: TRACK_CAMERA });
+    if (audioTrx?.mid && audioTrack) {
+      tracks.push({ location: 'local', mid: audioTrx.mid, trackName: TRACK_MIC });
+    }
+    if (videoTrx?.mid && videoTrack) {
+      tracks.push({ location: 'local', mid: videoTrx.mid, trackName: TRACK_CAMERA });
+    }
+    if (tracks.length === 0) {
+      console.warn('[zubrameet/cf-sfu] no local tracks to publish (no audio/video?)');
+      return;
+    }
 
     const tracksRes = await fetch(
       `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
