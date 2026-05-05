@@ -1003,9 +1003,51 @@ export class CFSFUConnection {
     // (например, ошибка в середине предыдущего start'а).
     this.screenSenders = [];
     try {
+      // Simulcast — три RTP-слоя через один transceiver. CF SFU выбирает каждому
+      // получателю тот слой, который тянет его канал, без явного участия с
+      // нашей стороны. Без simulcast все receivers получают один поток
+      // (preset.maxBitrate), и слабый канал тормозит/буферизует.
+      //
+      // - 'q' (quarter): 1/4 разрешения, 1/8 от full bitrate, 30fps cap.
+      //   Для слабых мобильных каналов / фоновых тайлов (не главный контент).
+      // - 'h' (half): 1/2 разрешения, 1/3 от full bitrate, 30fps cap.
+      //   Средний канал, или когда screen — не активный фокус у получателя.
+      // - 'f' (full): native res + fps + maxBitrate. Для полноценного просмотра.
+      //
+      // Note: simulcast в WebRTC требует VP8/VP9/AV1; H.264 simulcast в Chrome
+      // ненадёжен. Современный Chrome для screen-share по умолчанию выбирает
+      // VP9 (или VP8) — должно работать. Если encoder откажется (например,
+      // экзотический browser) — sendEncodings будет проигнорирован и
+      // получим обычный single-layer encoding.
+      const fullBitrate = preset.maxBitrate;
+      const fullFps = preset.frameRate;
+      const lowFps = Math.min(30, fullFps);
       const videoTrx = this.pc.addTransceiver(videoTrack, {
         direction: 'sendonly',
         streams: [stream],
+        sendEncodings: [
+          {
+            rid: 'q',
+            scaleResolutionDownBy: 4.0,
+            maxBitrate: Math.round(fullBitrate / 8),
+            maxFramerate: lowFps,
+            networkPriority: 'low',
+          },
+          {
+            rid: 'h',
+            scaleResolutionDownBy: 2.0,
+            maxBitrate: Math.round(fullBitrate / 3),
+            maxFramerate: lowFps,
+            networkPriority: 'medium',
+          },
+          {
+            rid: 'f',
+            scaleResolutionDownBy: 1.0,
+            maxBitrate: fullBitrate,
+            maxFramerate: fullFps,
+            networkPriority: 'high',
+          },
+        ],
       });
       videoSender = videoTrx.sender;
       this.screenSenders.push(videoTrx.sender);
@@ -1053,27 +1095,18 @@ export class CFSFUConnection {
     }
     release();
 
-    // Adaptive bitrate для screen-video. Параметры:
-    //   - maxBitrate из preset — потолок для нашего upstream к CF SFU. CF
-    //     дальше сам решает что слать каждому downstream-получателю и при
-    //     слабом канале у получателя дегрейдит без нашего участия.
-    //   - degradationPreference='maintain-resolution' — при просадке канала
-    //     роняем fps, но не разрешение. Читабельный документ на 10fps лучше
-    //     мутного на 30fps. Для камеры (motion) был бы 'balanced', для
-    //     screen-share (detail) — именно 'maintain-resolution'.
-    //   - networkPriority='high' — приоритет ресурсов над фоновыми соединениями.
+    // Encodings уже настроены через sendEncodings в addTransceiver выше
+    // (3 simulcast-слоя q/h/f с правильными maxBitrate / fps / scale).
+    // Здесь только дописываем degradationPreference на уровне всего sender'а:
+    // 'maintain-resolution' = при просадке канала роняем fps, не разрешение.
+    // Для screen-share с текстом/UI это важно — мутный документ хуже
+    // читается чем чёткий, пусть на 10fps. Не перезаписываем encodings.
     if (videoSender) {
       try {
         const params = videoSender.getParameters();
-        if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-        for (const enc of params.encodings) {
-          enc.maxBitrate = preset.maxBitrate;
-          enc.networkPriority = 'high';
-        }
         params.degradationPreference = 'maintain-resolution';
         await videoSender.setParameters(params);
       } catch (err) {
-        // Не критично — bitrate просто будет дефолтный.
         console.warn('[zubrameet/cf-sfu] setParameters(screen) failed', err);
       }
     }
