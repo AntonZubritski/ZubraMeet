@@ -1003,25 +1003,52 @@ export class CFSFUConnection {
     // (например, ошибка в середине предыдущего start'а).
     this.screenSenders = [];
     try {
-      // Single-layer encoding. Раньше тут был simulcast (3 RID-слоя q/h/f),
-      // но это раздувало upload отправителя в ~1.5× — он сам шлёт три потока
-      // даже если все получатели смотрят полный. Trade-off не оправдан для
-      // mobile-host'а на лимитированном канале.
+      // VP9 SVC (Scalable Video Coding) — внутри ОДНОГО RTP-потока зашиваем
+      // несколько scalability layers (3 spatial × 3 temporal в режиме K_SVC).
+      // Upload остаётся равен preset.maxBitrate, как у обычного single-layer
+      // encoding — никакого +1.5× simulcast tax. При этом CF SFU умеет
+      // отбрасывать «верхние» layers для каждого получателя независимо: у
+      // кого слабый канал — получит низкое разрешение и/или меньше fps;
+      // у кого быстрый — полный поток. Это работает только если CF получит
+      // VP9-поток (H.264 SVC в браузерах не поддерживается, VP8 SVC —
+      // только temporal). Поэтому ниже принудительно ставим VP9 в codec
+      // preferences ДО createOffer.
       //
-      // Вместо simulcast полагаемся на:
-      //   1. degradationPreference='maintain-resolution' (ниже) — encoder
-      //      сам роняет fps когда наш upstream упирается в потолок.
-      //   2. CF SFU собственную BWE — он умеет дегрейдить отправляемый
-      //      на конкретного receiver bitrate без simulcast (через RTCP
-      //      receiver reports).
-      //   3. Юзера, который выберет в Quality dropdown'е реалистичный
-      //      preset под свой канал (HD 720p 30fps вместо 1080p 60fps).
+      // L3T3_KEY = 3 spatial × 3 temporal с aligned key-frames (важно для
+      // screen-share — позволяет SFU чисто переключаться между layers без
+      // визуальных артефактов). Если encoder/браузер не поддержит — поле
+      // scalabilityMode будет проигнорировано и поток поедет single-layer.
+      // scalabilityMode пока не описан в стандартном lib.dom.d.ts (это
+      // относительно свежий WebRTC SVC API), поэтому передаём через cast.
+      // Браузеры которые не понимают поле — просто игнорируют.
       const videoTrx = this.pc.addTransceiver(videoTrack, {
         direction: 'sendonly',
         streams: [stream],
+        sendEncodings: [{
+          scalabilityMode: 'L3T3_KEY',
+        } as RTCRtpEncodingParameters],
       });
       videoSender = videoTrx.sender;
       this.screenSenders.push(videoTrx.sender);
+
+      // Принудительно VP9 — ставим его первым в codec preferences. Без этого
+      // Chrome для screen-share может выбрать VP8 или H.264 (зависит от
+      // negotiation), а у обоих proper SVC не работает: VP8 — только
+      // temporal scalability, H.264 — никакого SVC в браузере.
+      try {
+        const caps = RTCRtpSender.getCapabilities?.('video');
+        if (caps && typeof videoTrx.setCodecPreferences === 'function') {
+          const vp9 = caps.codecs.filter((c) => c.mimeType.toLowerCase() === 'video/vp9');
+          const others = caps.codecs.filter((c) => c.mimeType.toLowerCase() !== 'video/vp9');
+          if (vp9.length > 0) {
+            videoTrx.setCodecPreferences([...vp9, ...others]);
+          }
+        }
+      } catch (err) {
+        // setCodecPreferences может падать на старых браузерах — ничего
+        // страшного, поедем тем codec'ом что выберет negotiation.
+        console.warn('[zubrameet/cf-sfu] setCodecPreferences(VP9) failed', err);
+      }
       const audioTrx = audioTrack
         ? this.pc.addTransceiver(audioTrack, { direction: 'sendonly', streams: [stream] })
         : null;
@@ -1070,6 +1097,7 @@ export class CFSFUConnection {
     // 'maintain-resolution' — при упоре в потолок роняем fps, а не resolution.
     // Для screen-share (текст / UI / документы) чёткость важнее плавности.
     // networkPriority 'high' — приоритет полосы над фоновыми соединениями.
+    // scalabilityMode уже выставлен в addTransceiver — здесь его сохраняем.
     if (videoSender) {
       try {
         const params = videoSender.getParameters();
@@ -1080,6 +1108,23 @@ export class CFSFUConnection {
         }
         params.degradationPreference = 'maintain-resolution';
         await videoSender.setParameters(params);
+
+        // Диагностика: после applyParameters читаем что реально применилось.
+        // Если scalabilityMode не сохранилось — значит браузер/encoder его
+        // не поддерживает и поток едет single-layer, без SVC-преимуществ.
+        const applied = videoSender.getParameters();
+        const enc0 = applied.encodings?.[0] as
+          | (RTCRtpEncodingParameters & { scalabilityMode?: string })
+          | undefined;
+        const negotiatedCodec = (applied as RTCRtpSendParameters & {
+          codecs?: ReadonlyArray<{ mimeType?: string }>;
+        }).codecs?.[0]?.mimeType;
+        console.info(
+          '[zubrameet/cf-sfu] screen encoder:',
+          `codec=${negotiatedCodec ?? '?'}`,
+          `scalabilityMode=${enc0?.scalabilityMode ?? 'none'}`,
+          `maxBitrate=${enc0?.maxBitrate ?? '?'}`,
+        );
       } catch (err) {
         console.warn('[zubrameet/cf-sfu] setParameters(screen) failed', err);
       }
