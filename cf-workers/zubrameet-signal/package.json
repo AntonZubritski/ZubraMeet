@@ -1,0 +1,12 @@
+{
+  "name": "zubrameet-signal",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^3.96.0"
+  }
+}
