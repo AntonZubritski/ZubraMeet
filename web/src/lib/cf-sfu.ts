@@ -64,6 +64,11 @@ const SFU_API_BASE = 'https://zubrameet-sfu-proxy.ant-zubritski.workers.dev';
 const TRACK_MIC = 'mic';
 const TRACK_CAMERA = 'camera';
 const TRACK_SCREEN_VIDEO = 'screen-video';
+// Системный звук со экрана (если пользователь включил «Share audio» в picker'е).
+// Поддержка getDisplayMedia({audio:true}) платформо-зависима — Chrome/Edge на
+// Windows/macOS работают, Firefox не отдаёт системный звук, Safari ограничен
+// одной вкладкой. Если audio-track не пришёл — просто публикуем без него.
+const TRACK_SCREEN_AUDIO = 'screen-audio';
 
 // Bundle-policy 'max-bundle' — все tracks через один transport. Рекомендуется
 // CF docs, минимизирует количество ICE-кандидатов.
@@ -750,10 +755,15 @@ export class CFSFUConnection {
     this.negotiationLock = new Promise<void>((res) => { release = res; });
     await prev;
     try {
+      // Pull обе trackName — video обязательно, audio если у publisher'а есть.
+      // CF возвращает 404-подобную ошибку на отсутствующий track, поэтому шлём
+      // оба запроса; если audio не был опубликован, CF просто не отдаст его mid
+      // (или вернёт ошибку для всего request, что обрабатывается ниже).
       const requestTracks = [
         { location: 'remote' as const, sessionId: peer.sessionId, trackName: TRACK_SCREEN_VIDEO },
+        { location: 'remote' as const, sessionId: peer.sessionId, trackName: TRACK_SCREEN_AUDIO },
       ];
-      const res = await fetch(
+      let res = await fetch(
         `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
         {
           method: 'POST',
@@ -761,8 +771,24 @@ export class CFSFUConnection {
           body: JSON.stringify({ tracks: requestTracks }),
         },
       );
+      // Если CF не нашёл audio (publisher делил без звука) — повторим только
+      // с video. Без этого fallback'а весь pull падает и screen вообще не
+      // приходит.
       if (!res.ok) {
-        throw new Error(`tracks/new (pull screen) failed: ${res.status} ${await res.text()}`);
+        const fallback = await fetch(
+          `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              tracks: [requestTracks[0]],  // только video
+            }),
+          },
+        );
+        if (!fallback.ok) {
+          throw new Error(`tracks/new (pull screen) failed: ${res.status} ${await res.text()}`);
+        }
+        res = fallback;
       }
       const data = (await res.json()) as {
         requiresImmediateRenegotiation?: boolean;
@@ -772,10 +798,14 @@ export class CFSFUConnection {
       if (data.tracks) {
         for (const t of data.tracks) {
           if (typeof t.mid !== 'string') continue;
+          // trackName из CF — может быть screen-video или screen-audio.
+          // Оба маппим под kind='screen', чтобы handleRemoteTrack
+          // одинаково собрал их в один screenStream.
+          const trackName = typeof t.trackName === 'string' ? t.trackName : TRACK_SCREEN_VIDEO;
           this.midToPeer.set(t.mid, {
             peerId,
             kind: 'screen',
-            trackName: TRACK_SCREEN_VIDEO,
+            trackName,
           });
           let mids = this.peerToMids.get(peerId);
           if (!mids) { mids = new Set(); this.peerToMids.set(peerId, mids); }
@@ -877,13 +907,17 @@ export class CFSFUConnection {
     }
 
     const preset = getScreenQualityPreset(quality);
+    // audio: true — просим браузер показать в picker'е чекбокс «Share audio».
+    // Если пользователь его не выберет (или платформа не поддерживает —
+    // Firefox, Safari в большинстве случаев) — getDisplayMedia вернёт stream
+    // только с video-track, и мы это нормально обработаем.
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         width: { ideal: preset.width },
         height: { ideal: preset.height },
         frameRate: { ideal: preset.frameRate },
       },
-      audio: false,
+      audio: true,
     });
 
     // Защита от mirror-loop: если пользователь через picker выбрал саму
@@ -928,20 +962,35 @@ export class CFSFUConnection {
       throw new Error('startScreenShare: не получен video-track');
     }
 
-    // Отдельный sendonly transceiver под screen-video. Сериализуем под
-    // negotiationLock — параллельно может работать pull новых peer'ов.
+    // Аудио экрана может быть, может не быть — зависит от того согласился ли
+    // пользователь в picker'е и поддерживает ли браузер. Используем всё что
+    // выдали; будем publish только реально присутствующие tracks.
+    const audioTrack = stream.getAudioTracks()[0] ?? null;
+
+    // Отдельные sendonly transceiver'ы под screen-video и (опционально)
+    // screen-audio. Сериализуем под negotiationLock — параллельно может
+    // работать pull новых peer'ов.
     const prev = this.negotiationLock;
     let release!: () => void;
     this.negotiationLock = new Promise<void>((res) => { release = res; });
     await prev;
+    let videoSender: RTCRtpSender | null = null;
     try {
-      const transceiver = this.pc.addTransceiver(videoTrack, {
+      const videoTrx = this.pc.addTransceiver(videoTrack, {
         direction: 'sendonly',
         streams: [stream],
       });
+      videoSender = videoTrx.sender;
+      const audioTrx = audioTrack
+        ? this.pc.addTransceiver(audioTrack, { direction: 'sendonly', streams: [stream] })
+        : null;
 
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
+
+      const trackList: Array<{ location: 'local'; mid: string; trackName: string }> = [];
+      if (videoTrx.mid) trackList.push({ location: 'local', mid: videoTrx.mid, trackName: TRACK_SCREEN_VIDEO });
+      if (audioTrx?.mid) trackList.push({ location: 'local', mid: audioTrx.mid, trackName: TRACK_SCREEN_AUDIO });
 
       const tracksRes = await fetch(
         `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
@@ -950,11 +999,7 @@ export class CFSFUConnection {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             sessionDescription: this.pc.localDescription,
-            tracks: [{
-              location: 'local',
-              mid: transceiver.mid,
-              trackName: TRACK_SCREEN_VIDEO,
-            }],
+            tracks: trackList,
           }),
         },
       );
@@ -965,7 +1010,9 @@ export class CFSFUConnection {
         sessionDescription: RTCSessionDescriptionInit;
       };
       await this.pc.setRemoteDescription(tracksData.sessionDescription);
-      console.info('[zubrameet/cf-sfu] published screen track');
+      console.info(
+        '[zubrameet/cf-sfu] published screen track' + (audioTrack ? ' + audio' : ''),
+      );
     } catch (err) {
       // Откатить — иначе зависнет в half-state.
       for (const t of stream.getTracks()) {
@@ -976,6 +1023,31 @@ export class CFSFUConnection {
       throw err;
     }
     release();
+
+    // Adaptive bitrate для screen-video. Параметры:
+    //   - maxBitrate из preset — потолок для нашего upstream к CF SFU. CF
+    //     дальше сам решает что слать каждому downstream-получателю и при
+    //     слабом канале у получателя дегрейдит без нашего участия.
+    //   - degradationPreference='maintain-resolution' — при просадке канала
+    //     роняем fps, но не разрешение. Читабельный документ на 10fps лучше
+    //     мутного на 30fps. Для камеры (motion) был бы 'balanced', для
+    //     screen-share (detail) — именно 'maintain-resolution'.
+    //   - networkPriority='high' — приоритет ресурсов над фоновыми соединениями.
+    if (videoSender) {
+      try {
+        const params = videoSender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+        for (const enc of params.encodings) {
+          enc.maxBitrate = preset.maxBitrate;
+          enc.networkPriority = 'high';
+        }
+        params.degradationPreference = 'maintain-resolution';
+        await videoSender.setParameters(params);
+      } catch (err) {
+        // Не критично — bitrate просто будет дефолтный.
+        console.warn('[zubrameet/cf-sfu] setParameters(screen) failed', err);
+      }
+    }
 
     // Уведомляем peers — они начнут pull нашего screen.
     this.broadcastAppSignal({
@@ -1012,8 +1084,11 @@ export class CFSFUConnection {
       } catch { /* ignore */ }
     }
 
-    // Опционально — уведомить CF чтобы он освободил slot. Если CF API упадёт,
-    // не критично: при close PeerConnection всё равно освободится.
+    // Опционально — уведомить CF чтобы он освободил slot'ы. Если CF API
+    // упадёт, не критично: при close PeerConnection всё равно освободится.
+    // Передаём обе trackName — если audio не был опубликован, CF просто
+    // проигнорирует его в списке (или вернёт частичную ошибку, которую мы
+    // лугко обрабатываем через try/catch).
     if (this.pc && this.sessionId) {
       try {
         await fetch(
@@ -1022,7 +1097,10 @@ export class CFSFUConnection {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              tracks: [{ trackName: TRACK_SCREEN_VIDEO }],
+              tracks: [
+                { trackName: TRACK_SCREEN_VIDEO },
+                { trackName: TRACK_SCREEN_AUDIO },
+              ],
             }),
           },
         );
