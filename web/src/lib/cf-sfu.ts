@@ -456,6 +456,16 @@ export class CFSFUConnection {
     await pc.setRemoteDescription(sessionData.sessionDescription);
     console.info('[zubrameet/cf-sfu] session created:', this.sessionId);
 
+    // Race recovery: пока мы создавали session, signaling Worker мог уже
+    // прислать welcome со списком других peer'ов. Их queuePull сработал, но
+    // pullTracksImpl увидел this.sessionId === null и тихо вышел. Теперь
+    // sessionId есть — переинициируем pull для всех известных peer'ов с
+    // готовым sessionId. Без этого тот кто зашёл первым НЕ увидит других
+    // (асимметрия: второй видит первого через welcome, первый первого нет).
+    for (const [peerId, entry] of this.peers) {
+      if (entry.sessionId) this.queuePull(peerId);
+    }
+
     // Publish-этап: подменяем sendonly transceiver'ам real tracks от localStream
     // через replaceTrack (это не требует renegotiation), потом снова делаем
     // offer и шлём в tracks/new с явным mid+trackName маппингом.
@@ -536,7 +546,14 @@ export class CFSFUConnection {
   }
 
   private async pullTracksImpl(peerIds: string[]): Promise<void> {
-    if (!this.pc || !this.sessionId || this.closed) return;
+    if (!this.pc || this.closed) return;
+    // sessionId ещё не готов — setupPCAndPublish не успел вернуться. Не теряем
+    // peerIds: вернём их в pullQueue. setupPCAndPublish сам триггернёт повторный
+    // pull когда sessionId установится (см. вызов queuePull в конце publish-flow).
+    if (!this.sessionId) {
+      for (const pid of peerIds) this.pullQueue.add(pid);
+      return;
+    }
 
     // Собираем list remote-tracks, попутно запоминая порядок чтобы потом
     // смаппить ответ обратно на peerId.
