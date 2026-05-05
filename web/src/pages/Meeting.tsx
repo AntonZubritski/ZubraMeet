@@ -1249,6 +1249,20 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       setError(`Не удалось подключиться к P2P-комнате: ${msg}`);
       return;
     }
+
+    // Синхронизируем actual mediaState с peer'ами. CFSFUConnection стартует
+    // с { cam: true, mic: true } по дефолту — это правда для большинства
+    // случаев, но если пользователь зашёл с запретом на камеру/микрофон
+    // (acquireMedia вернул stream без соответствующих tracks), то peers
+    // получили бы неправильное «у меня всё включено» и рисовали бы чёрное
+    // окно вместо placeholder'а с аватаром. Если состояние при init было
+    // false (см. setMicOn(false)/setCamOn(false) выше) — здесь явно
+    // прокидываем реальные значения через signaling.
+    const hasMic = stream.getAudioTracks().length > 0;
+    const hasCam = stream.getVideoTracks().length > 0;
+    if (!hasMic || !hasCam) {
+      conn.setMediaState({ cam: hasCam, mic: hasMic });
+    }
   };
 
   // visibilitychange → если вкладка снова видна и треки сломаны, восстановить.
