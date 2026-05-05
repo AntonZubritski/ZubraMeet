@@ -355,7 +355,11 @@ const VIDEO_LADDER: MediaTrackConstraints[] = [
 
 /**
  * Пытаемся получить камеру+микрофон, спускаемся по лестнице 1080p→720p→480p,
- * затем audio-only.
+ * затем audio-only. Если ВСЕ варианты упали (типично — пользователь
+ * запретил доступ в браузере), возвращает пустой MediaStream без tracks —
+ * мит всё равно открывается, просто пользователь сидит без своего
+ * audio/video и видит/слышит остальных. На UI это отображается как «?» на
+ * иконках камеры/микрофона.
  */
 async function acquireMedia(): Promise<MediaStream> {
   const errors: string[] = [];
@@ -369,16 +373,19 @@ async function acquireMedia(): Promise<MediaStream> {
       errors.push(err instanceof Error ? err.message : String(err));
     }
   }
-  // Последний шанс — audio-only.
+  // Audio-only fallback.
   try {
     return await navigator.mediaDevices.getUserMedia({
       video: false,
       audio: AUDIO_CONSTRAINTS,
     });
   } catch (err) {
-    const last = err instanceof Error ? err.message : String(err);
-    throw new Error(`getUserMedia: ${errors.join(' | ')} (audio-only: ${last})`);
+    errors.push(`audio-only: ${err instanceof Error ? err.message : String(err)}`);
   }
+  // Полная неудача — возвращаем пустой MediaStream. Пользователь зайдёт в
+  // мит как «зритель» без локального media. Лог для диагностики.
+  console.warn('[Meeting] acquireMedia: no permissions, joining as viewer-only:', errors.join(' | '));
+  return new MediaStream();
 }
 
 const ENDPOINT_KIND_META: Record<EndpointKind, { icon: string; label: string }> = {
@@ -826,6 +833,14 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       localStreamRef.current = stream;
       setLocalStream(stream);
       attachTrackListeners(stream);
+
+      // Синхронизируем UI-state mic/cam с реально доступными tracks. Если
+      // пользователь запретил доступ к микрофону/камере, acquireMedia вернул
+      // stream без соответствующих tracks — кнопки в Controls покажут «?»
+      // badge и tooltip-подсказку; начальное состояние «включено» в этом
+      // случае врёт, поэтому ставим явно false.
+      if (stream.getAudioTracks().length === 0) setMicOn(false);
+      if (stream.getVideoTracks().length === 0) setCamOn(false);
 
       if (resolvedMode === 'sfu') {
         await startSfu(stream, cancelled);
@@ -1490,8 +1505,13 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   const handleToggleMic = (): void => {
     const ls = localStreamRef.current;
     if (!ls) return;
+    // Нет audio-track'а — пользователь зашёл без разрешения на микрофон.
+    // Toggle-кнопка показывает «?» badge и tooltip; клик просто игнорируем,
+    // чтобы случайно не «включить» несуществующий трек.
+    const audioTracks = ls.getAudioTracks();
+    if (audioTracks.length === 0) return;
     const enabled = !micOn;
-    for (const t of ls.getAudioTracks()) {
+    for (const t of audioTracks) {
       t.enabled = enabled;
     }
     setMicOn(enabled);
@@ -1504,8 +1524,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   const handleToggleCam = (): void => {
     const ls = localStreamRef.current;
     if (!ls) return;
+    const videoTracks = ls.getVideoTracks();
+    if (videoTracks.length === 0) return;
     const enabled = !camOn;
-    for (const t of ls.getVideoTracks()) {
+    for (const t of videoTracks) {
       t.enabled = enabled;
     }
     setCamOn(enabled);
@@ -2242,6 +2264,8 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       <Controls
         micOn={micOn}
         camOn={camOn}
+        micAvailable={(localStream?.getAudioTracks().length ?? 0) > 0}
+        camAvailable={(localStream?.getVideoTracks().length ?? 0) > 0}
         screenSharing={screenSharing}
         screenQuality={screenQuality}
         onToggleMic={handleToggleMic}

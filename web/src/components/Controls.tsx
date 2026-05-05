@@ -14,6 +14,12 @@ import EmojiPicker from './EmojiPicker';
 interface Props {
   micOn: boolean;
   camOn: boolean;
+  // Если false — у пользователя нет доступа к микрофону/камере (отказал
+  // в браузере, нет устройства). Кнопка отображается с «?» поверх иконки
+  // и tooltip-подсказкой, при клике ничего не toggle'ится — пользователь
+  // должен сам пойти в настройки браузера.
+  micAvailable?: boolean;
+  camAvailable?: boolean;
   screenSharing: boolean;
   // Текущий выбранный preset качества screen-share. Используется только когда
   // screenSharing === false — открыв dropdown, пользователь увидит активную опцию.
@@ -147,32 +153,64 @@ interface CircleButtonProps {
   onClick(): void;
   ariaLabel: string;
   pressed?: boolean;
+  // Маленький badge в углу. Используется для индикатора «нет доступа»
+  // (cam/mic permission denied) — поверх обычной иконки рисуется «?».
+  badge?: ReactNode;
   children: ReactNode;
 }
+
+const badgeWrapStyle: CSSProperties = {
+  position: 'relative',
+  display: 'inline-flex',
+};
+
+const questionBadgeStyle: CSSProperties = {
+  position: 'absolute',
+  top: -2,
+  right: -2,
+  width: 16,
+  height: 16,
+  borderRadius: '50%',
+  background: 'var(--danger)',
+  color: '#fff',
+  fontSize: 11,
+  fontWeight: 700,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  border: '2px solid rgba(20, 20, 20, 0.85)',
+  pointerEvents: 'none',
+  boxSizing: 'content-box',
+  lineHeight: 1,
+};
 
 function CircleButton({
   variant,
   onClick,
   ariaLabel,
   pressed,
+  badge,
   children,
 }: CircleButtonProps) {
   const [hovered, setHovered] = useState(false);
   return (
-    <button
-      type="button"
-      style={buttonStyle(variant, hovered)}
-      onClick={onClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onFocus={() => setHovered(true)}
-      onBlur={() => setHovered(false)}
-      aria-label={ariaLabel}
-      title={ariaLabel}
-      {...(pressed !== undefined ? { 'aria-pressed': pressed } : {})}
-    >
-      {children}
-    </button>
+    <span style={badgeWrapStyle}>
+      <button
+        type="button"
+        style={buttonStyle(variant, hovered)}
+        onClick={onClick}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onFocus={() => setHovered(true)}
+        onBlur={() => setHovered(false)}
+        aria-label={ariaLabel}
+        title={ariaLabel}
+        {...(pressed !== undefined ? { 'aria-pressed': pressed } : {})}
+      >
+        {children}
+      </button>
+      {badge !== undefined && <span style={questionBadgeStyle}>{badge}</span>}
+    </span>
   );
 }
 
@@ -747,6 +785,8 @@ function ChatButton({ open, unread, onClick }: ChatButtonProps) {
 export default function Controls({
   micOn,
   camOn,
+  micAvailable = true,
+  camAvailable = true,
   screenSharing,
   screenQuality,
   onToggleMic,
@@ -764,24 +804,36 @@ export default function Controls({
   hidden = false,
 }: Props) {
   const style: CSSProperties = hidden ? { ...barStyle, ...barHiddenStyle } : barStyle;
+  const micLabel = !micAvailable
+    ? 'Нет доступа к микрофону — разрешите в настройках браузера'
+    : micOn
+      ? 'Выключить микрофон'
+      : 'Включить микрофон';
+  const camLabel = !camAvailable
+    ? 'Нет доступа к камере — разрешите в настройках браузера'
+    : camOn
+      ? 'Выключить камеру'
+      : 'Включить камеру';
   return (
     <div style={style} role="toolbar" aria-label="Управление звонком" aria-hidden={hidden}>
       <CircleButton
-        variant={micOn ? 'default' : 'off'}
+        variant={micAvailable && micOn ? 'default' : 'off'}
         onClick={onToggleMic}
-        pressed={!micOn}
-        ariaLabel={micOn ? 'Выключить микрофон' : 'Включить микрофон'}
+        pressed={!micAvailable || !micOn}
+        ariaLabel={micLabel}
+        {...(!micAvailable ? { badge: '?' } : {})}
       >
-        <MicIcon off={!micOn} />
+        <MicIcon off={!micAvailable || !micOn} />
       </CircleButton>
 
       <CircleButton
-        variant={camOn ? 'default' : 'off'}
+        variant={camAvailable && camOn ? 'default' : 'off'}
         onClick={onToggleCam}
-        pressed={!camOn}
-        ariaLabel={camOn ? 'Выключить камеру' : 'Включить камеру'}
+        pressed={!camAvailable || !camOn}
+        ariaLabel={camLabel}
+        {...(!camAvailable ? { badge: '?' } : {})}
       >
-        <CamIcon off={!camOn} />
+        <CamIcon off={!camAvailable || !camOn} />
       </CircleButton>
 
       {isScreenShareSupported() && (
