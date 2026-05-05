@@ -32,11 +32,13 @@
 
 import {
   DEFAULT_SCREEN_QUALITY,
+  getScreenQualityPreset,
   type ScreenQuality,
 } from './screen-quality';
 import type {
   RemoteStreamKind,
   P2PMediaState,
+  P2PScreenState,
   ChatMessage,
   ReactionPayload,
   GifReactionPayload,
@@ -61,6 +63,7 @@ const SFU_API_BASE = 'https://zubrameet-sfu-proxy.ant-zubritski.workers.dev';
 // subscriber'ах — иначе CF не найдёт что pull'ить.
 const TRACK_MIC = 'mic';
 const TRACK_CAMERA = 'camera';
+const TRACK_SCREEN_VIDEO = 'screen-video';
 
 // Bundle-policy 'max-bundle' — все tracks через один transport. Рекомендуется
 // CF docs, минимизирует количество ICE-кандидатов.
@@ -77,6 +80,10 @@ interface PeerEntry {
   cameraStream: MediaStream | null;
   // Уже отправили ли onRemoteStream для этого peer'а (чтобы не дублировать).
   emittedCamera: boolean;
+  // Отдельный stream под screen-share этого peer'а — Meeting.tsx ждёт две
+  // независимые tile (камера + screen) на одного peer'а.
+  screenStream: MediaStream | null;
+  emittedScreen: boolean;
 }
 
 // Что хранится в response.tracks от CF после pull-запроса. Мы маппим mid → peerId
@@ -88,7 +95,7 @@ interface MidMapping {
 }
 
 interface AppSignalEnvelope {
-  kind: 'name' | 'media' | 'chat' | 'reaction' | 'gif-reaction';
+  kind: 'name' | 'media' | 'screen-state' | 'chat' | 'reaction' | 'gif-reaction';
   // shape зависит от kind
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   data: any;
@@ -106,6 +113,11 @@ export class CFSFUConnection {
 
   // Локальное cam/mic state, синхронизируется с peer'ами через signal/media.
   private localMediaState: P2PMediaState = { cam: true, mic: true };
+
+  // Активный screen-share стрим (от getDisplayMedia). null когда трансляция
+  // не запущена. Используется как локальный preview + источник track'а для
+  // /sessions/{id}/tracks/new, и как guard от двойного start'а.
+  private screenStream: MediaStream | null = null;
 
   private readonly peers: Map<string, PeerEntry> = new Map();
   // mid → (peerId, kind). Заполняется из ответов /tracks/new (location='remote').
@@ -182,6 +194,14 @@ export class CFSFUConnection {
     if (this.pullTimer !== null) {
       window.clearTimeout(this.pullTimer);
       this.pullTimer = null;
+    }
+    // Останавливаем screen-share треки — мы их создавали (getDisplayMedia),
+    // мы и убираем. localStream (камера) принадлежит caller'у, не трогаем.
+    if (this.screenStream) {
+      for (const t of this.screenStream.getTracks()) {
+        try { t.onended = null; t.stop(); } catch { /* ignore */ }
+      }
+      this.screenStream = null;
     }
     if (this.pc) {
       try { this.pc.close(); } catch { /* ignore */ }
@@ -304,6 +324,8 @@ export class CFSFUConnection {
         name: 'Участник',  // настоящее имя придёт через 'name' app-signal
         cameraStream: null,
         emittedCamera: false,
+        screenStream: null,
+        emittedScreen: false,
       };
       this.peers.set(peerId, entry);
       try {
@@ -314,6 +336,15 @@ export class CFSFUConnection {
       // Так каждый peer узнаёт friendly name остальных и видит mute-индикаторы.
       this.sendAppSignal(peerId, { kind: 'name', data: this.displayName });
       this.sendAppSignal(peerId, { kind: 'media', data: this.localMediaState });
+      // Если у нас активен screen-share — сразу сообщим новому peer'у, чтобы
+      // он зашёл и pull'нул наш screen-track. Иначе он увидит скрин только
+      // если мы рестартанем share.
+      if (this.screenStream) {
+        this.sendAppSignal(peerId, {
+          kind: 'screen-state',
+          data: { active: true, streamId: this.screenStream.id },
+        });
+      }
     } else if (sessionId && entry.sessionId !== sessionId) {
       entry.sessionId = sessionId;
     }
@@ -358,6 +389,28 @@ export class CFSFUConnection {
           try {
             this.events.onPeerMediaState?.(fromPeerId, { cam: d.cam, mic: d.mic });
           } catch (err) { this.reportError(err, 'onPeerMediaState'); }
+        }
+        break;
+      }
+      case 'screen-state': {
+        const s = payload.data as P2PScreenState | undefined;
+        if (s && typeof s.active === 'boolean') {
+          const streamId = typeof s.streamId === 'string' ? s.streamId : '';
+          if (s.active) {
+            // Peer начал share — pull его screen-track из CF SFU.
+            void this.pullScreenFromPeer(fromPeerId);
+          } else {
+            // Peer остановил share — UI должен убрать screen-tile. Также
+            // чистим локальный screenStream + emittedScreen, чтобы при
+            // повторном старте share новый stream показался как новый tile.
+            if (entry.screenStream) {
+              entry.screenStream = null;
+              entry.emittedScreen = false;
+            }
+          }
+          try {
+            this.events.onPeerScreenState?.(fromPeerId, { active: s.active, streamId });
+          } catch (err) { this.reportError(err, 'onPeerScreenState'); }
         }
         break;
       }
@@ -643,8 +696,25 @@ export class CFSFUConnection {
       return;
     }
 
-    // Аггрегируем audio + video одного peer'а в один MediaStream — UI ожидает
-    // именно так (один <video> с обоими треками).
+    if (meta.kind === 'screen') {
+      // Screen-share: отдельный MediaStream под screen-track, рендерится
+      // как отдельный tile в VideoGrid. У screen в нашей реализации только
+      // video (без audio) — он там не нужен и упрощает API.
+      if (!peer.screenStream) {
+        peer.screenStream = new MediaStream();
+      }
+      peer.screenStream.addTrack(event.track);
+      if (!peer.emittedScreen) {
+        peer.emittedScreen = true;
+        try {
+          this.events.onRemoteStream(peer.peerId, peer.screenStream, peer.name, 'screen');
+        } catch (err) { this.reportError(err, 'onRemoteStream(screen)'); }
+      }
+      return;
+    }
+
+    // camera (default): аггрегируем audio + video одного peer'а в один
+    // MediaStream — UI ожидает именно так (один <video> с обоими треками).
     if (!peer.cameraStream) {
       peer.cameraStream = new MediaStream();
     }
@@ -655,6 +725,84 @@ export class CFSFUConnection {
       try {
         this.events.onRemoteStream(peer.peerId, peer.cameraStream, peer.name, 'camera');
       } catch (err) { this.reportError(err, 'onRemoteStream'); }
+    }
+  }
+
+  // ─── CF SFU: pull peer screen-track ───────────────────────────────────────
+
+  private async pullScreenFromPeer(peerId: string): Promise<void> {
+    if (!this.pc || this.closed) return;
+    const peer = this.peers.get(peerId);
+    if (!peer || !peer.sessionId) return;
+    if (!this.sessionId) {
+      // Не готово ещё — повторим когда setupPCAndPublish закончит. Простейший
+      // способ — кладём в обычную pullQueue, и в финальной проверке там
+      // отработает (camera tracks тоже подтянутся, не страшно).
+      this.pullQueue.add(peerId);
+      return;
+    }
+
+    // Сериализуем negotiation. Параллельный pull camera + screen может
+    // случиться если screen-state приходит вплотную к peer-joined — без lock'а
+    // setRemoteDescription может улететь в InvalidStateError.
+    const prev = this.negotiationLock;
+    let release!: () => void;
+    this.negotiationLock = new Promise<void>((res) => { release = res; });
+    await prev;
+    try {
+      const requestTracks = [
+        { location: 'remote' as const, sessionId: peer.sessionId, trackName: TRACK_SCREEN_VIDEO },
+      ];
+      const res = await fetch(
+        `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tracks: requestTracks }),
+        },
+      );
+      if (!res.ok) {
+        throw new Error(`tracks/new (pull screen) failed: ${res.status} ${await res.text()}`);
+      }
+      const data = (await res.json()) as {
+        requiresImmediateRenegotiation?: boolean;
+        sessionDescription?: RTCSessionDescriptionInit;
+        tracks?: Array<{ mid?: string; trackName?: string }>;
+      };
+      if (data.tracks) {
+        for (const t of data.tracks) {
+          if (typeof t.mid !== 'string') continue;
+          this.midToPeer.set(t.mid, {
+            peerId,
+            kind: 'screen',
+            trackName: TRACK_SCREEN_VIDEO,
+          });
+          let mids = this.peerToMids.get(peerId);
+          if (!mids) { mids = new Set(); this.peerToMids.set(peerId, mids); }
+          mids.add(t.mid);
+        }
+      }
+      if (data.requiresImmediateRenegotiation && data.sessionDescription) {
+        await this.pc.setRemoteDescription(data.sessionDescription);
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        const renegotiateRes = await fetch(
+          `${SFU_API_BASE}/sessions/${this.sessionId}/renegotiate`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionDescription: this.pc.localDescription }),
+          },
+        );
+        if (!renegotiateRes.ok) {
+          throw new Error(`renegotiate (screen) failed: ${renegotiateRes.status}`);
+        }
+        console.info('[zubrameet/cf-sfu] pulled screen from', peerId);
+      }
+    } catch (err) {
+      this.reportError(err, 'pullScreenFromPeer');
+    } finally {
+      release();
     }
   }
 
@@ -708,19 +856,183 @@ export class CFSFUConnection {
     catch (err) { this.reportError(err, 'onGifReaction(self)'); }
   }
 
-  // ─── stubs (для API-совместимости с P2PMeetConnection) ────────────────────
+  // ─── screen share ─────────────────────────────────────────────────────────
 
-  // Screen share в CF SFU режиме пока не реализован — нужен отдельный publish
-  // дополнительного track'а через tracks/new + propagate screen-state.
-  // Будет добавлено в следующей итерации, после подтверждения что базовый
-  // video/audio path работает.
+  /**
+   * Запускает screen-share через CF SFU: getDisplayMedia → новый sendonly
+   * transceiver на нашей PC → publish через /sessions/{id}/tracks/new →
+   * broadcast через signaling 'screen-state'={active:true}, чтобы peers
+   * pull'нули наш screen-track.
+   *
+   * @param quality preset (HD/FullHD/4K) — влияет на resolution и frameRate
+   *   в getDisplayMedia + maxBitrate в encoding params.
+   */
+  async startScreenShare(quality: ScreenQuality = DEFAULT_SCREEN_QUALITY): Promise<MediaStream> {
+    if (this.screenStream) return this.screenStream;
+    if (!this.pc || !this.sessionId) {
+      throw new Error('startScreenShare: SFU connection not ready');
+    }
+    if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
+      throw new Error('Демонстрация экрана не поддерживается в этом браузере (мобильные iOS/Android не дают доступ к screen capture).');
+    }
 
-  async startScreenShare(_quality: ScreenQuality = DEFAULT_SCREEN_QUALITY): Promise<MediaStream> {
-    throw new Error('screen share не поддерживается в CF SFU режиме (пока)');
+    const preset = getScreenQualityPreset(quality);
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        width: { ideal: preset.width },
+        height: { ideal: preset.height },
+        frameRate: { ideal: preset.frameRate },
+      },
+      audio: false,
+    });
+
+    // Защита от mirror-loop: если пользователь через picker выбрал саму
+    // вкладку ZubraMeet — отменяем (бесконечная рекурсия + ужасный feedback).
+    const [videoTrack] = stream.getVideoTracks();
+    if (videoTrack) {
+      const settings = videoTrack.getSettings() as MediaTrackSettings & {
+        displaySurface?: string;
+      };
+      const isBrowserTab = settings.displaySurface === 'browser';
+      const labelHasOwnHost =
+        typeof window !== 'undefined' &&
+        videoTrack.label.length > 0 &&
+        videoTrack.label.includes(window.location.hostname);
+      if (isBrowserTab && labelHasOwnHost) {
+        for (const t of stream.getTracks()) {
+          try { t.stop(); } catch { /* ignore */ }
+        }
+        throw new Error(
+          'Нельзя демонстрировать саму вкладку ZubraMeet — это создаст бесконечную рекурсию. Выберите другую вкладку, окно или весь экран.',
+        );
+      }
+      // contentHint='detail' — encoder приоритезирует резкость для текста/UI
+      // над плавностью движения.
+      try { videoTrack.contentHint = 'detail'; } catch { /* ignore */ }
+    }
+
+    this.screenStream = stream;
+
+    // "Stop sharing" из browser overlay → стопим всё.
+    for (const track of stream.getTracks()) {
+      track.onended = () => {
+        if (this.screenStream === stream) {
+          void this.stopScreenShare();
+        }
+      };
+    }
+
+    if (!videoTrack) {
+      // Без video-track делать нечего — getDisplayMedia вернул пустой stream.
+      this.screenStream = null;
+      throw new Error('startScreenShare: не получен video-track');
+    }
+
+    // Отдельный sendonly transceiver под screen-video. Сериализуем под
+    // negotiationLock — параллельно может работать pull новых peer'ов.
+    const prev = this.negotiationLock;
+    let release!: () => void;
+    this.negotiationLock = new Promise<void>((res) => { release = res; });
+    await prev;
+    try {
+      const transceiver = this.pc.addTransceiver(videoTrack, {
+        direction: 'sendonly',
+        streams: [stream],
+      });
+
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+
+      const tracksRes = await fetch(
+        `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionDescription: this.pc.localDescription,
+            tracks: [{
+              location: 'local',
+              mid: transceiver.mid,
+              trackName: TRACK_SCREEN_VIDEO,
+            }],
+          }),
+        },
+      );
+      if (!tracksRes.ok) {
+        throw new Error(`tracks/new (publish screen) failed: ${tracksRes.status} ${await tracksRes.text()}`);
+      }
+      const tracksData = (await tracksRes.json()) as {
+        sessionDescription: RTCSessionDescriptionInit;
+      };
+      await this.pc.setRemoteDescription(tracksData.sessionDescription);
+      console.info('[zubrameet/cf-sfu] published screen track');
+    } catch (err) {
+      // Откатить — иначе зависнет в half-state.
+      for (const t of stream.getTracks()) {
+        try { t.onended = null; t.stop(); } catch { /* ignore */ }
+      }
+      this.screenStream = null;
+      release();
+      throw err;
+    }
+    release();
+
+    // Уведомляем peers — они начнут pull нашего screen.
+    this.broadcastAppSignal({
+      kind: 'screen-state',
+      data: { active: true, streamId: stream.id },
+    });
+
+    try { this.events.onScreenShareStarted?.(stream); }
+    catch (err) { this.reportError(err, 'onScreenShareStarted'); }
+
+    return stream;
   }
 
+  /**
+   * Останавливает screen-share. Идемпотентен.
+   */
   async stopScreenShare(): Promise<void> {
-    /* no-op */
+    const stream = this.screenStream;
+    if (!stream) return;
+    this.screenStream = null;
+
+    // Сразу broadcast — receiver'ы уберут screen-tile даже если track close
+    // выше упадёт (network error и т.д.).
+    this.broadcastAppSignal({
+      kind: 'screen-state',
+      data: { active: false, streamId: stream.id },
+    });
+
+    // Стопим local tracks. SFU сам уберёт sender при close их browser-side.
+    for (const track of stream.getTracks()) {
+      try {
+        track.onended = null;
+        track.stop();
+      } catch { /* ignore */ }
+    }
+
+    // Опционально — уведомить CF чтобы он освободил slot. Если CF API упадёт,
+    // не критично: при close PeerConnection всё равно освободится.
+    if (this.pc && this.sessionId) {
+      try {
+        await fetch(
+          `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/close`,
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              tracks: [{ trackName: TRACK_SCREEN_VIDEO }],
+            }),
+          },
+        );
+      } catch (err) {
+        this.reportError(err, 'tracks/close');
+      }
+    }
+
+    try { this.events.onScreenShareStopped?.(); }
+    catch (err) { this.reportError(err, 'onScreenShareStopped'); }
   }
 
   // ─── private ──────────────────────────────────────────────────────────────
