@@ -127,10 +127,15 @@ const searchInputStyle: CSSProperties = {
   boxSizing: 'border-box',
 };
 
+// Layout — multi-column (masonry). CSS Grid с aspect-ratio: 1/1 на ячейках
+// принудительно квадратит превью и обрезает их через object-fit; это плохо
+// смотрится для GIF, потому что у них типично не 1:1 (часто 16:9, 4:3 и
+// разнос между постами). Multi-column раскладывает элементы натуральными
+// высотами, без разрывов через breakInside и с равномерным gap'ом по обеим
+// осям. То что используют Discord, Telegram, Giphy.
 const gifGridStyle: CSSProperties = {
-  display: 'grid',
-  gridTemplateColumns: 'repeat(3, 1fr)',
-  gap: 4,
+  columnCount: 3,
+  columnGap: 4,
   // Жёсткий cap — иначе при 24 крупных гифках picker «уезжает» за viewport.
   maxHeight: 320,
   overflowY: 'auto',
@@ -139,22 +144,27 @@ const gifGridStyle: CSSProperties = {
 };
 
 const gifCellBtnStyle: CSSProperties = {
+  width: '100%',
   border: 'none',
   background: 'rgba(255, 255, 255, 0.04)',
   borderRadius: 6,
   padding: 0,
   cursor: 'pointer',
   overflow: 'hidden',
-  aspectRatio: '1 / 1',
   display: 'block',
+  // marginBottom — gap по вертикали внутри колонки. columnGap работает только
+  // между колонками, между элементами одной колонки нужен margin.
+  marginBottom: 4,
+  // Без break-inside: avoid элемент может разорваться между колонками
+  // (верхняя половина в одной, нижняя в другой) — выглядит как наложение.
+  breakInside: 'avoid',
   // Чтобы клик по картинке стрелял по button, а не по img.
   position: 'relative',
 };
 
 const gifThumbStyle: CSSProperties = {
   width: '100%',
-  height: '100%',
-  objectFit: 'cover',
+  height: 'auto',
   display: 'block',
   pointerEvents: 'none',
 };
