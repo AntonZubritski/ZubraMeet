@@ -157,7 +157,13 @@ export class CFSFUConnection {
     this.roomId = roomId;
     this.displayName = displayName;
     this.events = events;
-    this.peerId = generatePeerId();
+    // peerId persisted в sessionStorage per-room. Это критично для reload UX:
+    // при перезагрузке страницы сохраняется тот же peerId, DO видит дубликат
+    // в this.peers, закрывает старое WebSocket-соединение и принимает новое.
+    // Без этого reload генерил бы новый peerId, и для остальных участников
+    // он выглядел как ещё один отдельный пир рядом со старым (старый ещё не
+    // успел timeout'нуться) — копились stale tile'ы и duplicate event'ы.
+    this.peerId = getStablePeerId(roomId);
   }
 
   get peerCount(): number {
@@ -356,6 +362,19 @@ export class CFSFUConnection {
         });
       }
     } else if (sessionId && entry.sessionId !== sessionId) {
+      // sessionId сменился — peer перезагрузился или заново выпустил session.
+      // Все наши mid-маппинги для старого sessionId теперь ссылаются на
+      // мёртвые tracks. Очищаем чтобы новый pull создал чистый mapping и UI
+      // не продолжал держать пустую/чёрную tile от старого stream'а.
+      const oldMids = this.peerToMids.get(peerId);
+      if (oldMids) {
+        for (const mid of oldMids) this.midToPeer.delete(mid);
+        this.peerToMids.delete(peerId);
+      }
+      entry.cameraStream = null;
+      entry.emittedCamera = false;
+      entry.screenStream = null;
+      entry.emittedScreen = false;
       entry.sessionId = sessionId;
     }
 
@@ -1140,6 +1159,21 @@ function generatePeerId(): string {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Возвращает стабильный per-room peerId. Хранится в sessionStorage —
+// живёт пока вкладка открыта (включая reload), исчезает при close. Это
+// делает reload незаметным для других участников: тот же peerId → DO
+// закрывает старый WebSocket и переиспользует entry; не плодим дубликаты.
+function getStablePeerId(roomId: string): string {
+  const key = `zubrameet.peer.${roomId}`;
+  try {
+    const cached = window.sessionStorage.getItem(key);
+    if (cached && /^[a-f0-9]{16}$/.test(cached)) return cached;
+  } catch { /* sessionStorage может быть отключён */ }
+  const fresh = generatePeerId();
+  try { window.sessionStorage.setItem(key, fresh); } catch { /* ignore */ }
+  return fresh;
 }
 
 function clampDim(n: unknown): number {
