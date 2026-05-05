@@ -21,6 +21,8 @@ import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
 import type { P2PMeetEvents } from '../lib/p2p';
 import { CFSFUConnection } from '../lib/cf-sfu';
 import { getIceServers } from '../lib/ice';
+import { getAiNoiseSuppression } from '../lib/audio-settings';
+import { applyRnnoise, type NoiseSuppressionHandle } from '../lib/audio-rnnoise';
 import {
   DEFAULT_SCREEN_QUALITY,
   type ScreenQuality,
@@ -569,6 +571,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // Refs на длинноживущие объекты, чтобы cleanup точно их закрыл.
   const signalRef = useRef<SignalClient | null>(null);
   const sfuConnectionRef = useRef<MeetConnection | null>(null);
+  // Handle на активный RNNoise pipeline (если включён в Settings). dispose()
+  // вызывается на cleanup чтобы закрыть AudioContext и worklet.
+  const noiseSuppressionRef = useRef<NoiseSuppressionHandle | null>(null);
   // P2P-режим теперь использует CFSFUConnection (Cloudflare Realtime SFU)
   // вместо Trystero/MQTT mesh. API совместим — те же события, те же методы,
   // только под капотом всё едет через CF anycast SFU вместо peer-to-peer.
@@ -799,6 +804,17 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         }
         localStreamRef.current = null;
       }
+      // Закрываем RNNoise pipeline (если был активен): закрывает AudioContext,
+      // отключает worklet, останавливает оригинальные mic-tracks. Без этого
+      // микрофон остался бы «открытым» в браузере (индикатор записи).
+      if (noiseSuppressionRef.current) {
+        try {
+          noiseSuppressionRef.current.dispose();
+        } catch {
+          /* ignore */
+        }
+        noiseSuppressionRef.current = null;
+      }
     };
 
     // Pre-warm: запускаем fetch TURN-credentials параллельно с getUserMedia.
@@ -830,22 +846,48 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         }
         return;
       }
-      localStreamRef.current = stream;
-      setLocalStream(stream);
-      attachTrackListeners(stream);
+      // Если в Settings включено AI-шумоподавление — оборачиваем stream через
+      // RNNoise pipeline. Возвращается новый stream с processed audio +
+      // оригинальный video. Оригинальный stream продолжает жить как source
+      // для AudioContext (его НЕЛЬЗЯ stop'ить) — мы держим reference в
+      // отдельной переменной, чтобы cleanup мог его остановить вместе с
+      // AudioContext. Если getUserMedia не дал audio (permission denied) —
+      // applyRnnoise возвращает исходный stream без обработки.
+      let publishedStream = stream;
+      if (getAiNoiseSuppression() && stream.getAudioTracks().length > 0) {
+        try {
+          const handle = await applyRnnoise(stream);
+          if (cancelled) {
+            handle.dispose();
+            for (const t of stream.getTracks()) {
+              try { t.stop(); } catch { /* ignore */ }
+            }
+            return;
+          }
+          noiseSuppressionRef.current = handle;
+          publishedStream = handle.processedStream;
+        } catch (err) {
+          // RNNoise не должен ломать вход в мит — log и продолжаем без него.
+          console.warn('[Meeting] applyRnnoise failed, falling back to native suppression:', err);
+        }
+      }
+
+      localStreamRef.current = publishedStream;
+      setLocalStream(publishedStream);
+      attachTrackListeners(publishedStream);
 
       // Синхронизируем UI-state mic/cam с реально доступными tracks. Если
       // пользователь запретил доступ к микрофону/камере, acquireMedia вернул
       // stream без соответствующих tracks — кнопки в Controls покажут «?»
       // badge и tooltip-подсказку; начальное состояние «включено» в этом
       // случае врёт, поэтому ставим явно false.
-      if (stream.getAudioTracks().length === 0) setMicOn(false);
-      if (stream.getVideoTracks().length === 0) setCamOn(false);
+      if (publishedStream.getAudioTracks().length === 0) setMicOn(false);
+      if (publishedStream.getVideoTracks().length === 0) setCamOn(false);
 
       if (resolvedMode === 'sfu') {
-        await startSfu(stream, cancelled);
+        await startSfu(publishedStream, cancelled);
       } else {
-        await startP2P(stream, cancelled);
+        await startP2P(publishedStream, cancelled);
       }
     })();
 

@@ -10,6 +10,7 @@
     "typecheck": "tsc -b --noEmit"
   },
   "dependencies": {
+    "@sapphi-red/web-noise-suppressor": "^0.3.5",
     "@trystero-p2p/mqtt": "^0.24.0",
     "boring-avatars": "^2.0.4",
     "react": "^18.3.1",

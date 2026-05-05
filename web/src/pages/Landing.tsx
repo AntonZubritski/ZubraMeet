@@ -8,6 +8,7 @@ import {
 } from 'react';
 import { navigate } from '../App';
 import type { RoomCreateResp } from '../types';
+import { getAiNoiseSuppression, setAiNoiseSuppression } from '../lib/audio-settings';
 
 const NAME_KEY = 'zubrameet.name';
 
@@ -182,6 +183,11 @@ export default function Landing() {
   const [creating, setCreating] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string | null>(null);
+  // AI-шумоподавление (RNNoise через WASM). По умолчанию off — оно стоит
+  // ~5-10% CPU и не нужно если фон уже тихий или native-suppression
+  // справляется. Состояние сохраняется в localStorage и читается в Meeting.tsx
+  // когда мы acquireMedia.
+  const [aiNoise, setAiNoiseState] = useState<boolean>(() => getAiNoiseSuppression());
   // serverless = страница хостится без своего ZubraMeet-бэка (например, GitHub Pages).
   // В этом режиме все миты идут через P2P (/p2p/<id>), без /api/rooms.
   const [serverless, setServerless] = useState<boolean | null>(null);
@@ -365,6 +371,37 @@ export default function Landing() {
             Войти
           </button>
         </form>
+
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: 10,
+            padding: '10px 12px',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            cursor: 'pointer',
+            fontSize: 13,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={aiNoise}
+            onChange={(e) => {
+              const enabled = e.target.checked;
+              setAiNoiseState(enabled);
+              setAiNoiseSuppression(enabled);
+            }}
+            style={{ marginTop: 2, cursor: 'pointer' }}
+          />
+          <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <span>AI-шумоподавление микрофона</span>
+            <span style={{ fontSize: 11, color: 'var(--muted)', lineHeight: 1.4 }}>
+              Убирает клавиатуру, вентилятор, фоновые голоса. Использует
+              ~5–10% CPU. Применится к следующему миту.
+            </span>
+          </span>
+        </label>
       </div>
 
       <div style={footerStyle}>
