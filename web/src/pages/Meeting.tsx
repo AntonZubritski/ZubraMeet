@@ -2330,6 +2330,15 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         onChangeScreenQuality={setScreenQuality}
         onLeave={handleLeave}
         onCopyInvite={handleCopyInvite}
+        onOpenSettings={() =>
+          window.open(
+            // BASE_URL = '/' в dev, '/ZubraMeet/' в pages-build. Открываем в
+            // новой вкладке чтобы не убивать активный мит.
+            `${import.meta.env.BASE_URL}settings`,
+            '_blank',
+            'noopener,noreferrer',
+          )
+        }
         onSendReaction={handleSendReaction}
         // GIF-реакции работают только в P2P (data-channel в Trystero); SFU-режим
         // пока не пробрасывает кастомные actions, поэтому в нём GIF-tab скрыт.

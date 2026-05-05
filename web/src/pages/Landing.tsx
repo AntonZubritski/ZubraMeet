@@ -8,7 +8,6 @@ import {
 } from 'react';
 import { navigate } from '../App';
 import type { RoomCreateResp } from '../types';
-import { getAiNoiseSuppression, setAiNoiseSuppression } from '../lib/audio-settings';
 
 const NAME_KEY = 'zubrameet.name';
 
@@ -183,11 +182,6 @@ export default function Landing() {
   const [creating, setCreating] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string | null>(null);
-  // AI-шумоподавление (RNNoise через WASM). По умолчанию off — оно стоит
-  // ~5-10% CPU и не нужно если фон уже тихий или native-suppression
-  // справляется. Состояние сохраняется в localStorage и читается в Meeting.tsx
-  // когда мы acquireMedia.
-  const [aiNoise, setAiNoiseState] = useState<boolean>(() => getAiNoiseSuppression());
   // serverless = страница хостится без своего ZubraMeet-бэка (например, GitHub Pages).
   // В этом режиме все миты идут через P2P (/p2p/<id>), без /api/rooms.
   const [serverless, setServerless] = useState<boolean | null>(null);
@@ -372,36 +366,39 @@ export default function Landing() {
           </button>
         </form>
 
-        <label
+        <button
+          type="button"
+          onClick={() => navigate('/settings')}
           style={{
-            display: 'flex',
-            alignItems: 'flex-start',
-            gap: 10,
-            padding: '10px 12px',
+            background: 'transparent',
             border: '1px solid var(--border)',
+            color: 'var(--muted)',
+            padding: '10px 12px',
             borderRadius: 8,
             cursor: 'pointer',
             fontSize: 13,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 6,
           }}
         >
-          <input
-            type="checkbox"
-            checked={aiNoise}
-            onChange={(e) => {
-              const enabled = e.target.checked;
-              setAiNoiseState(enabled);
-              setAiNoiseSuppression(enabled);
-            }}
-            style={{ marginTop: 2, cursor: 'pointer' }}
-          />
-          <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            <span>AI-шумоподавление микрофона</span>
-            <span style={{ fontSize: 11, color: 'var(--muted)', lineHeight: 1.4 }}>
-              Убирает клавиатуру, вентилятор, фоновые голоса. Использует
-              ~5–10% CPU. Применится к следующему миту.
-            </span>
-          </span>
-        </label>
+          <svg
+            width={14}
+            height={14}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
+          Настройки
+        </button>
       </div>
 
       <div style={footerStyle}>

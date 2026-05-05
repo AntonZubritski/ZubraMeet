@@ -25,6 +25,7 @@ import type {
   CloudConfigResp,
   CloudProviderInfo,
 } from '../types';
+import { getAiNoiseSuppression, setAiNoiseSuppression } from '../lib/audio-settings';
 
 const pageStyle: CSSProperties = {
   minHeight: '100%',
@@ -170,6 +171,39 @@ const messageStyle = (kind: 'ok' | 'err' | 'info'): CSSProperties => {
 function disabledOverride(disabled: boolean): CSSProperties {
   if (!disabled) return {};
   return { opacity: 0.5, cursor: 'not-allowed' };
+}
+
+// Карточка с per-user аудио-настройками. Сохраняется в localStorage, не
+// зависит от cloud-config/SFU/Worker'а — просто работает где угодно. Поэтому
+// рендерится одинаково на forbidden / loading / main paths Settings-страницы.
+function AudioSettingsCard() {
+  const [aiNoise, setAiNoise] = useState<boolean>(() => getAiNoiseSuppression());
+  const onToggle = (e: ChangeEvent<HTMLInputElement>): void => {
+    const enabled = e.target.checked;
+    setAiNoise(enabled);
+    setAiNoiseSuppression(enabled);
+  };
+  return (
+    <div style={cardStyle}>
+      <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--fg)' }}>Аудио</div>
+      <label style={{ ...checkboxRowStyle, alignItems: 'flex-start', gap: 10 }}>
+        <input
+          type="checkbox"
+          checked={aiNoise}
+          onChange={onToggle}
+          style={{ marginTop: 2, cursor: 'pointer' }}
+        />
+        <span style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span>AI-шумоподавление микрофона</span>
+          <span style={{ fontSize: 12, color: 'var(--muted)', lineHeight: 1.5 }}>
+            Убирает клавиатуру, вентилятор, фоновые голоса и уличный шум через
+            нейросеть RNNoise (WebAssembly). Использует ~5–10% CPU. Изменение
+            применится при следующем входе в мит.
+          </span>
+        </span>
+      </label>
+    </div>
+  );
 }
 
 interface UrlParams {
@@ -321,16 +355,22 @@ export default function Settings() {
   };
 
   if (forbidden) {
+    // Cloud-relay недоступен (запущено не на хост-машине / serverless deploy
+    // как GitHub Pages). Аудио-настройки — per-user в localStorage, не
+    // зависят от сервера, поэтому показываем их в любом случае.
     return (
       <div style={pageStyle}>
         <div style={containerStyle}>
-          <h1 style={titleStyle}>Настройки</h1>
-          <div style={messageStyle('info')}>
-            Эта страница доступна только на машине хоста (через localhost).
+          <div style={headerRowStyle}>
+            <button type="button" style={backBtnStyle} onClick={() => navigate('/')}>
+              ← Назад
+            </button>
+            <h1 style={titleStyle}>Настройки</h1>
           </div>
-          <button type="button" style={secondaryBtnStyle} onClick={() => navigate('/')}>
-            На главную
-          </button>
+          <AudioSettingsCard />
+          <div style={messageStyle('info')}>
+            Cloud-relay настройки доступны только на машине хоста (через localhost).
+          </div>
         </div>
       </div>
     );
@@ -340,8 +380,14 @@ export default function Settings() {
     return (
       <div style={pageStyle}>
         <div style={containerStyle}>
-          <h1 style={titleStyle}>Настройки</h1>
-          <p style={subtitleStyle}>Загрузка…</p>
+          <div style={headerRowStyle}>
+            <button type="button" style={backBtnStyle} onClick={() => navigate('/')}>
+              ← Назад
+            </button>
+            <h1 style={titleStyle}>Настройки</h1>
+          </div>
+          <AudioSettingsCard />
+          <p style={subtitleStyle}>Загрузка cloud-relay настроек…</p>
         </div>
       </div>
     );
@@ -359,6 +405,8 @@ export default function Settings() {
           </button>
           <h1 style={titleStyle}>Настройки</h1>
         </div>
+
+        <AudioSettingsCard />
 
         <p style={subtitleStyle}>
           Cloud-relay помогает обойти CGNAT провайдера: ZubraMeet поднимает

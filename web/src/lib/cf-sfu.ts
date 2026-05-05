@@ -123,6 +123,10 @@ export class CFSFUConnection {
   // не запущена. Используется как локальный preview + источник track'а для
   // /sessions/{id}/tracks/new, и как guard от двойного start'а.
   private screenStream: MediaStream | null = null;
+  // Senders, которые мы создали под текущий screen-publish. Сохраняем чтобы
+  // на stop сделать replaceTrack(null) и не оставлять «висящие» transceiver'ы
+  // в PC, которые при следующем start ломают негошацию.
+  private screenSenders: RTCRtpSender[] = [];
 
   private readonly peers: Map<string, PeerEntry> = new Map();
   // mid → (peerId, kind). Заполняется из ответов /tracks/new (location='remote').
@@ -208,6 +212,7 @@ export class CFSFUConnection {
       }
       this.screenStream = null;
     }
+    this.screenSenders = [];
     if (this.pc) {
       try { this.pc.close(); } catch { /* ignore */ }
       this.pc = null;
@@ -975,15 +980,20 @@ export class CFSFUConnection {
     this.negotiationLock = new Promise<void>((res) => { release = res; });
     await prev;
     let videoSender: RTCRtpSender | null = null;
+    // Очищаем список с прошлого share — на случай неполного cleanup'а
+    // (например, ошибка в середине предыдущего start'а).
+    this.screenSenders = [];
     try {
       const videoTrx = this.pc.addTransceiver(videoTrack, {
         direction: 'sendonly',
         streams: [stream],
       });
       videoSender = videoTrx.sender;
+      this.screenSenders.push(videoTrx.sender);
       const audioTrx = audioTrack
         ? this.pc.addTransceiver(audioTrack, { direction: 'sendonly', streams: [stream] })
         : null;
+      if (audioTrx) this.screenSenders.push(audioTrx.sender);
 
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
@@ -1069,14 +1079,28 @@ export class CFSFUConnection {
     if (!stream) return;
     this.screenStream = null;
 
-    // Сразу broadcast — receiver'ы уберут screen-tile даже если track close
-    // выше упадёт (network error и т.д.).
+    // Сразу broadcast — receiver'ы уберут screen-tile даже не дожидаясь
+    // нашего sender cleanup'а.
     this.broadcastAppSignal({
       kind: 'screen-state',
       data: { active: false, streamId: stream.id },
     });
 
-    // Стопим local tracks. SFU сам уберёт sender при close их browser-side.
+    // КРИТИЧНО: replaceTrack(null) + removeTrack для всех наших screen-sender'ов
+    // ДО stop()/close(). Без этого при следующем startScreenShare PC окажется
+    // с двумя transceiver'ами под screen-video (stopped + новый), CF не понимает
+    // SDP и возвращает 400 на tracks/new — у получателей чёрный экран.
+    // pc.removeTrack помечает transceiver как direction=inactive, и при
+    // следующей negotiation он не участвует.
+    if (this.pc) {
+      for (const sender of this.screenSenders) {
+        try { await sender.replaceTrack(null); } catch { /* ignore */ }
+        try { this.pc.removeTrack(sender); } catch { /* ignore */ }
+      }
+    }
+    this.screenSenders = [];
+
+    // Стопим local tracks (это останавливает захват с экрана).
     for (const track of stream.getTracks()) {
       try {
         track.onended = null;
@@ -1084,30 +1108,15 @@ export class CFSFUConnection {
       } catch { /* ignore */ }
     }
 
-    // Опционально — уведомить CF чтобы он освободил slot'ы. Если CF API
-    // упадёт, не критично: при close PeerConnection всё равно освободится.
-    // Передаём обе trackName — если audio не был опубликован, CF просто
-    // проигнорирует его в списке (или вернёт частичную ошибку, которую мы
-    // лугко обрабатываем через try/catch).
-    if (this.pc && this.sessionId) {
-      try {
-        await fetch(
-          `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/close`,
-          {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              tracks: [
-                { trackName: TRACK_SCREEN_VIDEO },
-                { trackName: TRACK_SCREEN_AUDIO },
-              ],
-            }),
-          },
-        );
-      } catch (err) {
-        this.reportError(err, 'tracks/close');
-      }
-    }
+    // Намеренно НЕ вызываем CF tracks/close здесь — текущий формат запроса
+    // ({trackName}) возвращает 400 Bad Request, а правильная сигнатура
+    // зависит от mid/sessionId на стороне receiver'ов и не документирована
+    // в публичном API на этом уровне детализации. removeTrack выше уже
+    // фактически освобождает sender для CF (он увидит пустой transceiver
+    // в следующем SDP). При close PeerConnection слот в любом случае
+    // освободится. Если когда-нибудь понадобится ранний cleanup на CF
+    // стороне — добавим renegotiate с новым SDP, в котором screen-track'и
+    // отсутствуют.
 
     try { this.events.onScreenShareStopped?.(); }
     catch (err) { this.reportError(err, 'onScreenShareStopped'); }
