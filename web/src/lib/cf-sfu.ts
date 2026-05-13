@@ -141,6 +141,15 @@ export class CFSFUConnection {
   // Renegotiation мьютекс — параллельные tracks/new ломают SDP state.
   private negotiationLock: Promise<void> = Promise.resolve();
 
+  // WS reconnect state. CF Workers Durable Object иногда обрывает WS без
+  // close-frame (code 1006), и наш announce/app-signals (chat, mediaState,
+  // screen-state, name) после этого молча перестают доходить. Реконнектим с
+  // expo-backoff, после reconnect повторно announce'им наш sessionId — DO
+  // пришлёт welcome с актуальным списком peers, и handlePeerKnown идемпотентно
+  // переподпишется на новых.
+  private wsReconnectAttempt = 0;
+  private wsReconnectTimer: number | null = null;
+
   private closed = false;
   private started = false;
 
@@ -175,10 +184,27 @@ export class CFSFUConnection {
   async start(localStream: MediaStream): Promise<void> {
     if (this.started) return;
     this.started = true;
+    // Логируем что реально пришло в localStream — без этого диагностировать
+    // «он меня не слышит» невозможно: не видно, был ли вообще audio-track,
+    // включён ли он, и не пришёл ли он muted.
+    const audioTracks = localStream.getAudioTracks();
+    const videoTracks = localStream.getVideoTracks();
     console.info('[zubrameet/cf-sfu] start', {
       roomId: this.roomId,
       name: this.displayName,
       peerId: this.peerId,
+      audio: audioTracks.map((t) => ({
+        enabled: t.enabled,
+        muted: t.muted,
+        readyState: t.readyState,
+        label: t.label,
+      })),
+      video: videoTracks.map((t) => ({
+        enabled: t.enabled,
+        muted: t.muted,
+        readyState: t.readyState,
+        label: t.label,
+      })),
     });
 
     try {
@@ -209,6 +235,10 @@ export class CFSFUConnection {
     if (this.pullTimer !== null) {
       window.clearTimeout(this.pullTimer);
       this.pullTimer = null;
+    }
+    if (this.wsReconnectTimer !== null) {
+      window.clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
     }
     // Останавливаем screen-share треки — мы их создавали (getDisplayMedia),
     // мы и убираем. localStream (камера) принадлежит caller'у, не трогаем.
@@ -244,6 +274,7 @@ export class CFSFUConnection {
       const onOpen = () => {
         ws.removeEventListener('error', onError);
         console.info('[zubrameet/cf-sfu] signal connected');
+        this.wsReconnectAttempt = 0;
         resolve();
       };
       const onError = () => {
@@ -262,12 +293,41 @@ export class CFSFUConnection {
 
       ws.addEventListener('close', (ev) => {
         if (this.closed) return;
-        this.reportError(
-          new Error(`signal disconnected (code=${ev.code})`),
-          'ws close',
-        );
+        // code 1000 = graceful (наш close()) — не реконнектим.
+        // code 1006 = abnormal closure (CF Workers Durable Object иногда обрывает
+        // соединение, особенно при idle > 60s). Реконнектим с expo-backoff.
+        console.warn(`[zubrameet/cf-sfu] ws closed (code=${ev.code}), scheduling reconnect`);
+        this.scheduleSignalReconnect();
       });
     });
+  }
+
+  private scheduleSignalReconnect(): void {
+    if (this.closed) return;
+    if (this.wsReconnectTimer !== null) return;
+    const attempt = this.wsReconnectAttempt++;
+    // 500ms, 1s, 2s, 4s, max 10s.
+    const delay = Math.min(500 * Math.pow(2, attempt), 10_000);
+    this.wsReconnectTimer = window.setTimeout(() => {
+      this.wsReconnectTimer = null;
+      if (this.closed) return;
+      console.info(`[zubrameet/cf-sfu] ws reconnect attempt #${attempt + 1}`);
+      this.connectSignal()
+        .then(() => {
+          // Перепредставляемся — DO пришлёт нам свежий welcome со списком
+          // peers, handlePeerKnown пройдётся идемпотентно (для уже-known
+          // peer'ов не дублирует tile, для новых поставит pull в очередь).
+          this.announceSession();
+        })
+        .catch((err) => {
+          console.warn('[zubrameet/cf-sfu] ws reconnect failed:', err);
+          // Сначала фейл — потом снова scheduleSignalReconnect (срабатывает
+          // из onclose listener'а нового неудачного WebSocket'а), backoff
+          // продолжится. Если онклоуз не приедет (WebSocket вообще не открылся),
+          // явно перепланируем.
+          this.scheduleSignalReconnect();
+        });
+    }, delay);
   }
 
   private announceSession(): void {
@@ -512,8 +572,13 @@ export class CFSFUConnection {
 
     // Bootstrap-этап: создаём sendonly transceiver'ы (без real tracks пока),
     // делаем минимальный offer, отправляем в sessions/new для получения sessionId.
-    pc.addTransceiver('audio', { direction: 'sendonly' });
-    pc.addTransceiver('video', { direction: 'sendonly' });
+    // КРИТИЧНО: храним ссылки на сами объекты, а не ищем потом через filter по
+    // .receiver.track.kind — на sendonly transceiver'ах receiver direction
+    // inactive, kind может быть unset, и lookup ломается (mic тогда replace'ится
+    // в video-trx → CF получает audio под video-mid → audio mid вообще без
+    // трека → peer'ы tracks/new(mic) получают пустоту и тебя не слышат).
+    const audioTrx = pc.addTransceiver('audio', { direction: 'sendonly' });
+    const videoTrx = pc.addTransceiver('video', { direction: 'sendonly' });
 
     const bootstrapOffer = await pc.createOffer();
     await pc.setLocalDescription(bootstrapOffer);
@@ -548,31 +613,40 @@ export class CFSFUConnection {
       if (entry.sessionId) this.queuePull(peerId);
     }
 
-    // Publish-этап: подменяем sendonly transceiver'ам real tracks от localStream
-    // через replaceTrack (это не требует renegotiation), потом снова делаем
-    // offer и шлём в tracks/new с явным mid+trackName маппингом.
+    // Publish-этап: подменяем сохранённым выше sendonly transceiver'ам real
+    // tracks от localStream через replaceTrack (не требует renegotiation),
+    // потом делаем offer и шлём в tracks/new с явным mid+trackName маппингом.
     const audioTrack = localStream.getAudioTracks()[0];
     const videoTrack = localStream.getVideoTracks()[0];
-    const transceivers = pc.getTransceivers();
-    const audioTrx = transceivers.find((t) => t.sender.track === null && t.receiver.track?.kind === 'audio') ?? transceivers.find((t) => t.receiver.track?.kind === 'audio');
-    const videoTrx = transceivers.find((t) => t.sender.track === null && t.receiver.track?.kind === 'video') ?? transceivers.find((t) => t.receiver.track?.kind === 'video');
 
-    if (audioTrack && audioTrx) await audioTrx.sender.replaceTrack(audioTrack);
-    if (videoTrack && videoTrx) await videoTrx.sender.replaceTrack(videoTrack);
+    if (audioTrack) await audioTrx.sender.replaceTrack(audioTrack);
+    if (videoTrack) await videoTrx.sender.replaceTrack(videoTrack);
 
     // Make offer уже с реальными tracks.
     const publishOffer = await pc.createOffer();
     await pc.setLocalDescription(publishOffer);
 
     const tracks: Array<{ location: 'local'; mid: string; trackName: string }> = [];
-    if (audioTrx?.mid && audioTrack) {
+    if (audioTrx.mid && audioTrack) {
       tracks.push({ location: 'local', mid: audioTrx.mid, trackName: TRACK_MIC });
     }
-    if (videoTrx?.mid && videoTrack) {
+    if (videoTrx.mid && videoTrack) {
       tracks.push({ location: 'local', mid: videoTrx.mid, trackName: TRACK_CAMERA });
     }
+    console.info('[zubrameet/cf-sfu] publishing tracks:', tracks, {
+      audioMid: audioTrx.mid,
+      videoMid: videoTrx.mid,
+      hasAudio: !!audioTrack,
+      hasVideo: !!videoTrack,
+    });
     if (tracks.length === 0) {
       console.warn('[zubrameet/cf-sfu] no local tracks to publish (no audio/video?)');
+      // Откатываем publishOffer — без этого PC застрянет в have-local-offer,
+      // и любой последующий pull renegotiate (CF присылает свой offer) упадёт
+      // в InvalidStateError. Симптом: ты никого не видишь/не слышишь, потому
+      // что setRemoteDescription для pull'нутых tracks тихо падает.
+      try { await pc.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit); }
+      catch (err) { console.warn('[zubrameet/cf-sfu] rollback failed', err); }
       return;
     }
 
@@ -595,6 +669,29 @@ export class CFSFUConnection {
     };
     await pc.setRemoteDescription(tracksData.sessionDescription);
     console.info('[zubrameet/cf-sfu] published local tracks');
+
+    // Через 3 сек после publish'а снимаем outbound-rtp stats — если для audio
+    // packetsSent == 0, значит трек дошёл до CF но реально RTP не льётся
+    // (track muted, audio source молчит, RNNoise worklet не пропускает звук).
+    // Это финальный критерий «реально ли peer слышит меня».
+    window.setTimeout(() => {
+      if (!this.pc || this.closed) return;
+      void this.pc.getStats().then((stats) => {
+        const summary: Array<{ kind: string; packets: number; bytes: number; mid?: string }> = [];
+        stats.forEach((report) => {
+          if (report.type === 'outbound-rtp') {
+            const r = report as RTCOutboundRtpStreamStats & { mid?: string };
+            summary.push({
+              kind: r.kind,
+              packets: r.packetsSent ?? 0,
+              bytes: r.bytesSent ?? 0,
+              mid: r.mid,
+            });
+          }
+        });
+        console.info('[zubrameet/cf-sfu] outbound-rtp after 3s:', summary);
+      }).catch(() => { /* getStats может фейлить — ничего страшного */ });
+    }, 3000);
   }
 
   // ─── CF SFU: pull peer tracks ─────────────────────────────────────────────
