@@ -571,6 +571,27 @@ export class CFSFUConnection {
               entry.screenStream = null;
               entry.emittedScreen = false;
             }
+            // КРИТИЧНО для stop→start цикла: publisher не renegotiate'ит CF
+            // при stopScreenShare (CF tracks/close вернёт 400 на текущем
+            // формате запроса — см. комментарий в stopScreenShare). У CF на
+            // session'е остаются «висячие» screen mid'ы. При повторном start
+            // на receiver'е могут прилететь ontrack-события на ТЕ ЖЕ mid'ы
+            // — наш midToPeer всё ещё содержит {kind:'screen'} mapping для
+            // них, handleRemoteTrack кладёт muted track в свежий screenStream
+            // → у получателя чёрный экран. Чистим screen-mid'ы заранее,
+            // чтобы при повторном start новый pull создал чистый mapping.
+            const mids = this.peerToMids.get(fromPeerId);
+            if (mids) {
+              const toRemove: string[] = [];
+              for (const mid of mids) {
+                const meta = this.midToPeer.get(mid);
+                if (meta?.kind === 'screen') {
+                  this.midToPeer.delete(mid);
+                  toRemove.push(mid);
+                }
+              }
+              for (const mid of toRemove) mids.delete(mid);
+            }
           }
           try {
             this.events.onPeerScreenState?.(fromPeerId, { active: s.active, streamId });
@@ -1015,6 +1036,10 @@ export class CFSFUConnection {
         sessionDescription?: RTCSessionDescriptionInit;
         tracks?: Array<{ mid?: string; trackName?: string }>;
       };
+      console.info(
+        '[zubrameet/cf-sfu] pullScreen response',
+        { peerId, tracks: data.tracks, renegotiate: data.requiresImmediateRenegotiation },
+      );
       if (data.tracks) {
         for (const t of data.tracks) {
           if (typeof t.mid !== 'string') continue;
