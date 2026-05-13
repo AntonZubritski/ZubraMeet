@@ -89,6 +89,12 @@ interface PeerEntry {
   // независимые tile (камера + screen) на одного peer'а.
   screenStream: MediaStream | null;
   emittedScreen: boolean;
+  // Поставлен в true когда peer прислал screen-state{active:true}. Сбрасывается
+  // в false при screen-state{active:false}. Используется periodic re-pull'ом
+  // чтобы понять: peer демонстрирует экран, но мы ещё не получили его треки
+  // (та же гонка что и с камерой — publisher tracks/new ещё в полёте на CF,
+  // наш первый pull уезжает раньше).
+  wantsScreen: boolean;
 }
 
 // Что хранится в response.tracks от CF после pull-запроса. Мы маппим mid → peerId
@@ -247,18 +253,28 @@ export class CFSFUConnection {
     if (this.periodicPullTimer !== null) return;
     this.periodicPullTimer = window.setInterval(() => {
       if (this.closed) return;
-      let queued = 0;
+      let cameraQueued = 0;
+      const screenPeers: string[] = [];
       for (const [peerId, entry] of this.peers) {
+        if (!entry.sessionId) continue;
         // Подписаны только когда хотя бы один track реально пришёл и emit'ился
         // в UI. До этого момента peer может стоять в peers Map с sessionId,
         // но без живого cameraStream — это и есть «висячий» пир, которого
         // надо retry.
-        if (entry.sessionId && !entry.emittedCamera) {
+        if (!entry.emittedCamera) {
           this.pullQueue.add(peerId);
-          queued++;
+          cameraQueued++;
+        }
+        // Тот же механизм для screen: если peer сообщил что демонстрирует
+        // (wantsScreen=true), но мы ещё не приклеили его screen-track —
+        // повторим pull. pullScreenFromPeer защищён negotiationLock, так что
+        // параллельные вызовы безопасны (и идемпотентны: внутри проверяется
+        // emittedScreen). См. ниже добавленный early-return.
+        if (entry.wantsScreen && !entry.emittedScreen) {
+          screenPeers.push(peerId);
         }
       }
-      if (queued > 0 && this.pullTimer === null) {
+      if (cameraQueued > 0 && this.pullTimer === null) {
         this.pullTimer = window.setTimeout(() => {
           this.pullTimer = null;
           const list = Array.from(this.pullQueue);
@@ -266,6 +282,10 @@ export class CFSFUConnection {
           console.info('[zubrameet/cf-sfu] periodic re-pull for', list.length, 'peer(s)');
           void this.runPull(list);
         }, 100);
+      }
+      for (const pid of screenPeers) {
+        console.info('[zubrameet/cf-sfu] periodic re-pull screen from', pid);
+        void this.pullScreenFromPeer(pid);
       }
     }, CFSFUConnection.PERIODIC_PULL_INTERVAL_MS);
   }
@@ -447,6 +467,7 @@ export class CFSFUConnection {
         emittedCamera: false,
         screenStream: null,
         emittedScreen: false,
+        wantsScreen: false,
       };
       this.peers.set(peerId, entry);
       try {
@@ -480,6 +501,10 @@ export class CFSFUConnection {
       entry.emittedCamera = false;
       entry.screenStream = null;
       entry.emittedScreen = false;
+      // wantsScreen тоже сбрасываем — после reload пир мог завершить
+      // screen-share, и пока он не пришлёт нам новое screen-state{active:true},
+      // periodic-pull дёргать screen бессмысленно.
+      entry.wantsScreen = false;
       entry.sessionId = sessionId;
     }
 
@@ -531,12 +556,17 @@ export class CFSFUConnection {
         if (s && typeof s.active === 'boolean') {
           const streamId = typeof s.streamId === 'string' ? s.streamId : '';
           if (s.active) {
-            // Peer начал share — pull его screen-track из CF SFU.
+            // Peer начал share — отмечаем намерение pull'а и тут же пробуем.
+            // Если CF SFU ещё не успел зарегистрировать его screen-track
+            // (его publish HTTP в полёте), наш pull вернётся с пустыми
+            // tracks — periodic re-pull ниже повторит через 2с.
+            entry.wantsScreen = true;
             void this.pullScreenFromPeer(fromPeerId);
           } else {
             // Peer остановил share — UI должен убрать screen-tile. Также
             // чистим локальный screenStream + emittedScreen, чтобы при
             // повторном старте share новый stream показался как новый tile.
+            entry.wantsScreen = false;
             if (entry.screenStream) {
               entry.screenStream = null;
               entry.emittedScreen = false;
@@ -925,6 +955,10 @@ export class CFSFUConnection {
     if (!this.pc || this.closed) return;
     const peer = this.peers.get(peerId);
     if (!peer || !peer.sessionId) return;
+    // Идемпотентность для periodic re-pull'а: если screen-track уже пришёл и
+    // отдан UI'ю — больше pull'ить не нужно. Без этого мы бы плодили дубли
+    // recvonly transceiver'ов и getting "no mapping for mid" warnings.
+    if (peer.emittedScreen) return;
     if (!this.sessionId) {
       // Не готово ещё — повторим когда setupPCAndPublish закончит. Простейший
       // способ — кладём в обычную pullQueue, и в финальной проверке там
