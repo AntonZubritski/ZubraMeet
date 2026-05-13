@@ -150,6 +150,17 @@ export class CFSFUConnection {
   private wsReconnectAttempt = 0;
   private wsReconnectTimer: number | null = null;
 
+  // Periodic re-pull. После того как сосед делает announce, его tracks могут
+  // ещё не быть готовы в CF SFU (его собственный tracks/new (publish) HTTP в
+  // полёте). Наш первый pull через 100ms debounce уезжает раньше — CF либо
+  // отдаёт пустой data.tracks, либо requiresImmediateRenegotiation:false, и
+  // мы подписку не делаем. Worker про это не пинает повторно. До reload
+  // соседа не видно. Решение — каждые 2 сек проверять: есть peers с
+  // sessionId, но без cameraStream → ещё раз pull. Останавливается когда
+  // подписан хотя бы один track (peer.cameraStream !== null).
+  private periodicPullTimer: number | null = null;
+  private static readonly PERIODIC_PULL_INTERVAL_MS = 2000;
+
   private closed = false;
   private started = false;
 
@@ -227,6 +238,36 @@ export class CFSFUConnection {
 
     // Сообщаем всем в комнате наш sessionId — чтобы они начали pull нашего media.
     this.announceSession();
+
+    // Запускаем периодический re-pull (см. periodicPullTimer комментарий).
+    this.startPeriodicPull();
+  }
+
+  private startPeriodicPull(): void {
+    if (this.periodicPullTimer !== null) return;
+    this.periodicPullTimer = window.setInterval(() => {
+      if (this.closed) return;
+      let queued = 0;
+      for (const [peerId, entry] of this.peers) {
+        // Подписаны только когда хотя бы один track реально пришёл и emit'ился
+        // в UI. До этого момента peer может стоять в peers Map с sessionId,
+        // но без живого cameraStream — это и есть «висячий» пир, которого
+        // надо retry.
+        if (entry.sessionId && !entry.emittedCamera) {
+          this.pullQueue.add(peerId);
+          queued++;
+        }
+      }
+      if (queued > 0 && this.pullTimer === null) {
+        this.pullTimer = window.setTimeout(() => {
+          this.pullTimer = null;
+          const list = Array.from(this.pullQueue);
+          this.pullQueue.clear();
+          console.info('[zubrameet/cf-sfu] periodic re-pull for', list.length, 'peer(s)');
+          void this.runPull(list);
+        }, 100);
+      }
+    }, CFSFUConnection.PERIODIC_PULL_INTERVAL_MS);
   }
 
   close(): void {
@@ -239,6 +280,10 @@ export class CFSFUConnection {
     if (this.wsReconnectTimer !== null) {
       window.clearTimeout(this.wsReconnectTimer);
       this.wsReconnectTimer = null;
+    }
+    if (this.periodicPullTimer !== null) {
+      window.clearInterval(this.periodicPullTimer);
+      this.periodicPullTimer = null;
     }
     // Останавливаем screen-share треки — мы их создавали (getDisplayMedia),
     // мы и убираем. localStream (камера) принадлежит caller'у, не трогаем.
@@ -765,15 +810,31 @@ export class CFSFUConnection {
       tracks?: Array<{ mid?: string; trackName?: string }>;
     };
 
-    // Маппим ответ tracks → (peerId, kind). CF возвращает их в том же порядке
-    // что и request, согласно docs. mid'ы в ответе соответствуют новым
-    // recvonly transceiver'ам, которые CF создал в своём offer'е (приходит
-    // с requiresImmediateRenegotiation).
-    if (data.tracks && data.tracks.length === order.length) {
+    // Маппим ответ tracks → (peerId, kind). Раньше полагались на порядок,
+    // но при гонке announce/publish CF может вернуть частичный ответ
+    // (например только camera, без mic пока publish ещё не доехал) — тогда
+    // length-проверка отбрасывала весь mapping и pull пропадал в пустоту.
+    // Теперь матчим по trackName из ответа, что робастно к частичным
+    // ответам; periodic re-pull позже подтянет недостающие.
+    if (data.tracks) {
+      if (data.tracks.length !== order.length) {
+        console.warn(
+          '[zubrameet/cf-sfu] partial pull response:',
+          `requested=${order.length} returned=${data.tracks.length}`,
+          'peers=', peerIds,
+        );
+      }
       for (let i = 0; i < data.tracks.length; i++) {
-        const mid = data.tracks[i].mid;
+        const t = data.tracks[i];
+        const mid = t.mid;
         if (typeof mid !== 'string') continue;
-        const meta = order[i];
+        // Сначала пробуем смаппить по trackName (если CF вернул) на нашу
+        // order-запись с тем же trackName. Это устойчиво к перемешиванию или
+        // пропускам в ответе.
+        const meta = (typeof t.trackName === 'string'
+          ? order.find((o) => o.trackName === t.trackName)
+          : null) ?? order[i];
+        if (!meta) continue;
         this.midToPeer.set(mid, meta);
         let mids = this.peerToMids.get(meta.peerId);
         if (!mids) {
@@ -845,6 +906,10 @@ export class CFSFUConnection {
       peer.cameraStream = new MediaStream();
     }
     peer.cameraStream.addTrack(event.track);
+    console.info(
+      '[zubrameet/cf-sfu] remote track attached',
+      { peerId: meta.peerId, kind: event.track.kind, trackName: meta.trackName, mid },
+    );
 
     if (!peer.emittedCamera) {
       peer.emittedCamera = true;
