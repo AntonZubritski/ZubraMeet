@@ -95,6 +95,14 @@ interface PeerEntry {
   // (та же гонка что и с камерой — publisher tracks/new ещё в полёте на CF,
   // наш первый pull уезжает раньше).
   wantsScreen: boolean;
+  // In-flight флаги для защиты от параллельных pull'ов одного и того же peer'а.
+  // Без них две параллельные ветки (handleAppSignal screen-state + periodic
+  // re-pull, либо peer-joined + WS reconnect re-welcome) обе проходят
+  // emittedCamera/emittedScreen guard когда тот ещё false, обе уезжают в CF,
+  // CF выдаёт ДВА разных mid'а под одним trackName → handleRemoteTrack
+  // дважды addTrack'ит audio в один MediaStream → голос звучит дважды.
+  cameraPullInFlight: boolean;
+  screenPullInFlight: boolean;
 }
 
 // Что хранится в response.tracks от CF после pull-запроса. Мы маппим mid → peerId
@@ -468,6 +476,8 @@ export class CFSFUConnection {
         screenStream: null,
         emittedScreen: false,
         wantsScreen: false,
+        cameraPullInFlight: false,
+        screenPullInFlight: false,
       };
       this.peers.set(peerId, entry);
       try {
@@ -831,12 +841,23 @@ export class CFSFUConnection {
     }
 
     // Собираем list remote-tracks, попутно запоминая порядок чтобы потом
-    // смаппить ответ обратно на peerId.
+    // смаппить ответ обратно на peerId. Фильтруем peers которых мы уже
+    // подписали (emittedCamera=true) или для которых pull уже летит
+    // (cameraPullInFlight=true). Без этого WS reconnect → re-welcome →
+    // handlePeerKnown → queuePull даёт второй pull для того же peer'а,
+    // CF аллоцирует новые mid'ы под mic/camera, handleRemoteTrack
+    // addTrack'ит второй audio-track в peer.cameraStream → голос слышен
+    // дважды. Заодно маркируем in-flight чтобы параллельные runPull
+    // (debounce ≠ mutex) не уехали с тем же peerId.
     const requestTracks: Array<{ location: 'remote'; sessionId: string; trackName: string }> = [];
     const order: Array<{ peerId: string; kind: RemoteStreamKind; trackName: string }> = [];
+    const claimed: PeerEntry[] = [];
     for (const pid of peerIds) {
       const peer = this.peers.get(pid);
       if (!peer || !peer.sessionId) continue;
+      if (peer.emittedCamera || peer.cameraPullInFlight) continue;
+      peer.cameraPullInFlight = true;
+      claimed.push(peer);
       requestTracks.push({ location: 'remote', sessionId: peer.sessionId, trackName: TRACK_MIC });
       order.push({ peerId: pid, kind: 'camera', trackName: TRACK_MIC });
       requestTracks.push({ location: 'remote', sessionId: peer.sessionId, trackName: TRACK_CAMERA });
@@ -844,6 +865,7 @@ export class CFSFUConnection {
     }
     if (requestTracks.length === 0) return;
 
+    try {
     const res = await fetch(
       `${SFU_API_BASE}/sessions/${this.sessionId}/tracks/new`,
       {
@@ -913,6 +935,12 @@ export class CFSFUConnection {
       }
       console.info('[zubrameet/cf-sfu] renegotiated for', peerIds.length, 'peer(s)');
     }
+    } finally {
+      // Снимаем in-flight маркер для всех peers которых мы захватили в этом
+      // вызове. Это критично для retry: если pull упал на середине, periodic
+      // re-pull должен суметь повторить через 2 сек.
+      for (const peer of claimed) peer.cameraPullInFlight = false;
+    }
   }
 
   private handleRemoteTrack(event: RTCTrackEvent): void {
@@ -941,7 +969,7 @@ export class CFSFUConnection {
       if (!peer.screenStream) {
         peer.screenStream = new MediaStream();
       }
-      peer.screenStream.addTrack(event.track);
+      replaceTrackInStream(peer.screenStream, event.track);
       if (!peer.emittedScreen) {
         peer.emittedScreen = true;
         try {
@@ -956,7 +984,7 @@ export class CFSFUConnection {
     if (!peer.cameraStream) {
       peer.cameraStream = new MediaStream();
     }
-    peer.cameraStream.addTrack(event.track);
+    replaceTrackInStream(peer.cameraStream, event.track);
     console.info(
       '[zubrameet/cf-sfu] remote track attached',
       { peerId: meta.peerId, kind: event.track.kind, trackName: meta.trackName, mid },
@@ -980,6 +1008,14 @@ export class CFSFUConnection {
     // отдан UI'ю — больше pull'ить не нужно. Без этого мы бы плодили дубли
     // recvonly transceiver'ов и getting "no mapping for mid" warnings.
     if (peer.emittedScreen) return;
+    // КРИТИЧНО: in-flight guard. Без него handleAppSignal screen-state +
+    // periodic re-pull (каждые 2с) — оба видят emittedScreen=false и оба
+    // делают свой POST /tracks/new. CF аллоцирует ДВА разных mid'а под
+    // TRACK_SCREEN_AUDIO, оба маппятся в midToPeer как kind:'screen',
+    // оба ontrack попадают в peer.screenStream через addTrack → у получателя
+    // голос publisher'а слышен ДВАЖДЫ (одна звуковая дорожка — реальная,
+    // вторая — дубликат от того же source, но в новом RTP-потоке).
+    if (peer.screenPullInFlight) return;
     if (!this.sessionId) {
       // Не готово ещё — повторим когда setupPCAndPublish закончит. Простейший
       // способ — кладём в обычную pullQueue, и в финальной проверке там
@@ -987,6 +1023,7 @@ export class CFSFUConnection {
       this.pullQueue.add(peerId);
       return;
     }
+    peer.screenPullInFlight = true;
 
     // Сериализуем negotiation. Параллельный pull camera + screen может
     // случиться если screen-state приходит вплотную к peer-joined — без lock'а
@@ -995,6 +1032,13 @@ export class CFSFUConnection {
     let release!: () => void;
     this.negotiationLock = new Promise<void>((res) => { release = res; });
     await prev;
+    // Re-check после получения lock'а — за время ожидания всё могло поменяться
+    // (peer ушёл, screen уже emit'ился из параллельного потока).
+    if (this.closed || peer.emittedScreen) {
+      peer.screenPullInFlight = false;
+      release();
+      return;
+    }
     try {
       // Pull обе trackName — video обязательно, audio если у publisher'а есть.
       // CF возвращает 404-подобную ошибку на отсутствующий track, поэтому шлём
@@ -1077,6 +1121,7 @@ export class CFSFUConnection {
     } catch (err) {
       this.reportError(err, 'pullScreenFromPeer');
     } finally {
+      peer.screenPullInFlight = false;
       release();
     }
   }
@@ -1447,6 +1492,25 @@ function getStablePeerId(roomId: string): string {
   const fresh = generatePeerId();
   try { window.sessionStorage.setItem(key, fresh); } catch { /* ignore */ }
   return fresh;
+}
+
+// Заменяет в MediaStream'е track того же kind, что и новый. Если уже был
+// (audio/video) трек этого kind'а — снимаем его и stop'аем, потом добавляем
+// новый. Без этого, при любом дублированном pull'е (race / повторный
+// peer-joined / restart screen-share), addTrack просто аккумулирует, и у
+// receiver'а получается два audio-track'а в одном stream'е → голос дважды.
+//
+// stop() безопасен для remote track'а — это закрывает локальный receiver,
+// не затрагивая publisher'а. Если того же track instance ещё нет — функция
+// no-op (idempotent).
+function replaceTrackInStream(stream: MediaStream, track: MediaStreamTrack): void {
+  if (stream.getTracks().includes(track)) return;  // тот же instance — пропускаем
+  const existing = track.kind === 'audio' ? stream.getAudioTracks() : stream.getVideoTracks();
+  for (const old of existing) {
+    try { stream.removeTrack(old); } catch { /* ignore */ }
+    try { old.stop(); } catch { /* ignore */ }
+  }
+  stream.addTrack(track);
 }
 
 function clampDim(n: unknown): number {
