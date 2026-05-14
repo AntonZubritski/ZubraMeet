@@ -490,7 +490,12 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
     () => new Map(),
   );
   const [micOn, setMicOn] = useState<boolean>(true);
-  const [camOn, setCamOn] = useState<boolean>(true);
+  // Камера по дефолту ВЫКЛ — стандарт Google Meet / Zoom: юзер не должен
+  // вваливаться в мит с включённой камерой, а должен явно её включить через
+  // кнопку. Acquire всё равно делаем (чтобы у getUserMedia был permission и
+  // мы могли быстро toggle на лету через track.enabled=true). Перед publish'ем
+  // ставим track.enabled=false ниже.
+  const [camOn, setCamOn] = useState<boolean>(false);
   const [stats, setStats] = useState<ConnectionStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState<boolean>(false);
@@ -900,6 +905,15 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       localStreamRef.current = publishedStream;
       setLocalStream(publishedStream);
       attachTrackListeners(publishedStream);
+
+      // Применяем camOn=false по умолчанию: gлушим video-track ДО публикации,
+      // чтобы peers получили чёрные frames (камера выкл) с самого начала, а
+      // не мелькание реальной картинки. Юзер потом сам нажмёт кнопку. Mic
+      // оставляем включённым (стандартное поведение). Делаем через .enabled —
+      // permission остаётся, toggle мгновенный без re-acquire.
+      for (const t of publishedStream.getVideoTracks()) {
+        t.enabled = camOn;
+      }
 
       // Синхронизируем UI-state mic/cam с реально доступными tracks. Если
       // пользователь запретил доступ к микрофону/камере, acquireMedia вернул
@@ -1352,18 +1366,16 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
     }
 
     // Синхронизируем actual mediaState с peer'ами. CFSFUConnection стартует
-    // с { cam: true, mic: true } по дефолту — это правда для большинства
-    // случаев, но если пользователь зашёл с запретом на камеру/микрофон
-    // (acquireMedia вернул stream без соответствующих tracks), то peers
-    // получили бы неправильное «у меня всё включено» и рисовали бы чёрное
-    // окно вместо placeholder'а с аватаром. Если состояние при init было
-    // false (см. setMicOn(false)/setCamOn(false) выше) — здесь явно
-    // прокидываем реальные значения через signaling.
+    // с { cam: true, mic: true } по дефолту, но у нас по UX камера всегда
+    // выключена в момент входа (см. setCamOn(false) при init state). Так что
+    // ВСЕГДА явно прокидываем реальные {camOn, micOn} — иначе peers нарисуют
+    // чёрный квадрат вместо аватара.
     const hasMic = stream.getAudioTracks().length > 0;
     const hasCam = stream.getVideoTracks().length > 0;
-    if (!hasMic || !hasCam) {
-      conn.setMediaState({ cam: hasCam, mic: hasMic });
-    }
+    conn.setMediaState({
+      cam: hasCam && camOn,
+      mic: hasMic && micOn,
+    });
   };
 
   // visibilitychange → если вкладка снова видна и треки сломаны, восстановить.
