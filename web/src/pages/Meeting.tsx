@@ -495,6 +495,17 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   const [error, setError] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState<boolean>(false);
   const [reconnectAttempt, setReconnectAttempt] = useState<number>(0);
+  // Initial-connect overlay. true пока (а) signaling+session ещё не подняты
+  // ИЛИ (б) другие peers могут быть в комнате но мы их ещё не подтянули.
+  // Сбрасывается:
+  //  - при первом onPeerJoined (значит мы видим что в комнате уже кто-то есть
+  //    и сейчас будут tile'ы)
+  //  - по таймауту 4с после старта (значит мы скорее всего одни в комнате —
+  //    нет смысла дальше показывать «подключаемся»)
+  //  - при ошибке (error state перекроет всё равно)
+  // Без этого юзер заходит, видит пустой грид + свой tile, и пугается «никого нет»
+  // даже если peers уже в комнате (race между welcome → pull → ontrack).
+  const [connecting, setConnecting] = useState<boolean>(false);
   // Share-panel state (host-only — гости получат 403 и панель не отрисуется).
   // В P2P-режиме всю панель не показываем (используется одна кнопка "copy link").
   const [endpoints, setEndpoints] = useState<Endpoint[] | null>(null);
@@ -677,6 +688,16 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       }
     };
   }, [joined, chatOpen]);
+
+  // Initial-connect overlay lifecycle. Запускается при первом переходе в
+  // joined=true (как auto-join хоста с лендинга, так и ручной join гостя).
+  // Сбросится либо в onPeerJoined handler'е, либо по таймауту 4с (мы одни).
+  useEffect(() => {
+    if (!joined) return;
+    setConnecting(true);
+    const t = window.setTimeout(() => setConnecting(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [joined]);
 
   // Recover camera/microphone после sleep/wake.
   // Останавливаем старые треки, getUserMedia заново, replaceLocalTracks на publishPC.
@@ -952,6 +973,7 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         });
       },
       onPeerJoined: (peer: PeerInfo) => {
+        setConnecting(false);
         peerNamesRef.current.set(peer.id, peer.name);
         // Обновляем имя в уже существующих записях, если ключ совпал.
         setPeers((prev) => {
@@ -1115,6 +1137,9 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         });
       },
       onPeerJoined: (peerId, name) => {
+        // Первый peer-joined — снимаем initial-connect overlay (даже до того
+        // как pull tracks доедет до ontrack, юзер уже знает что не один).
+        setConnecting(false);
         peerNamesRef.current.set(peerId, name);
         // Если поток уже есть — обновляем имя.
         setPeers((prev) => {
@@ -2383,6 +2408,17 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
                 Попытка {reconnectAttempt}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {connecting && !reconnecting && (
+        <div style={overlayStyle} role="status" aria-live="polite">
+          <div style={overlayBoxStyle}>
+            <div>Подключаемся к комнате…</div>
+            <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+              Ищем участников
+            </div>
           </div>
         </div>
       )}
