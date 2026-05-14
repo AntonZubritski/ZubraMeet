@@ -243,7 +243,10 @@ export default function Settings() {
     void (async () => {
       try {
         const resp = await fetch('/api/cloudconfig');
-        if (resp.status === 403) {
+        // 403 — гость на хостовом сервере. 404 — serverless deploy (GitHub
+        // Pages, нет бэкенда вообще). Оба — нормальные сценарии, не ошибка:
+        // cloud-relay просто недоступен, аудио-настройки и сам мит работают.
+        if (resp.status === 403 || resp.status === 404) {
           if (!cancelled) setForbidden(true);
           return;
         }
@@ -266,8 +269,17 @@ export default function Settings() {
         setRegion(data.region || initialRegions[0]?.code || '');
       } catch (err) {
         if (cancelled) return;
+        // fetch() throw'ает на network-level фейлах (CORS, отсутствие
+        // соединения). На serverless deploys это типичный случай — не
+        // показываем как ошибку, ведём себя как 404: cloud-relay недоступен,
+        // forbidden-state покажет дружелюбную инфо-плашку.
         const text = err instanceof Error ? err.message : String(err);
-        setMessage({ kind: 'err', text: `Не удалось загрузить настройки: ${text}` });
+        const isNetworkLike = err instanceof TypeError || /Failed to fetch/i.test(text);
+        if (isNetworkLike) {
+          setForbidden(true);
+        } else {
+          setMessage({ kind: 'err', text: `Не удалось загрузить настройки: ${text}` });
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -369,7 +381,9 @@ export default function Settings() {
           </div>
           <AudioSettingsCard />
           <div style={messageStyle('info')}>
-            Cloud-relay настройки доступны только на машине хоста (через localhost).
+            Cloud-relay недоступен в этой сборке. Эта фича работает только когда
+            ZubraMeet запущен локально как бинарник (хост-сервер). В web-версии
+            используй обычный CF или P2P режим — оба не требуют TURN-сервера.
           </div>
         </div>
       </div>
