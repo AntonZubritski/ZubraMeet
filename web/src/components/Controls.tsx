@@ -111,15 +111,11 @@ const barStyle: CSSProperties = {
   zIndex: 100,
   transition: 'transform 250ms ease, opacity 250ms ease',
   opacity: 1,
-  // Mobile fit: на узких экранах bar шире viewport'а — кнопки обрезались по
-  // краям. Ограничиваем max-width и даём горизонтальный скролл; scrollbar
-  // прячем (на мобилке всё равно свайпом). На десктопе влезает без скролла.
-  maxWidth: 'calc(100vw - 16px)',
-  overflowX: 'auto',
-  scrollbarWidth: 'none',
-  // Кнопки не должны сжиматься под weight gap'а — фиксируем флекс-базис.
-  // (Этого недостаточно само по себе — нужно ещё на каждую кнопку flex-shrink:0,
-  // см. iconBtnStyle ниже.)
+  // НЕ ставим overflow-x:auto — это сломает popover'ы (emoji picker, quality
+  // dropdown), потому что CSS spec форсит overflow-y тоже на не-visible когда
+  // overflow-x:auto, и popover'ы торчащие НАД bar'ом обрезаются. Кнопки на
+  // мобиле уменьшаются в buttonStyle до 38×38, и всё влезает в 375px viewport.
+  // Если будет ещё уже устройство — добавим max-width 100vw, но БЕЗ overflow.
 };
 
 // Стиль когда bar скрыт (idle 5с): уезжает вниз за пределы viewport
