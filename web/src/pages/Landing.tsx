@@ -95,16 +95,52 @@ const inputStyle: CSSProperties = {
   outline: 'none',
 };
 
-const primaryBtnStyle: CSSProperties = {
-  width: '100%',
-  padding: '12px 16px',
-  background: 'var(--accent)',
-  color: '#0a0a0a',
-  border: 'none',
-  borderRadius: 8,
-  fontSize: 15,
-  fontWeight: 600,
+// Стиль для выбора режима — две карточки (CF / P2P) рядом друг с другом.
+// На узких экранах схлопывается в колонку через flex-wrap.
+const modeCardsStyle: CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: 10,
+};
+
+const modeCardBaseStyle: CSSProperties = {
+  flex: '1 1 160px',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+  padding: '14px 14px 12px',
+  background: 'var(--panel)',
+  border: '1px solid var(--border)',
+  borderRadius: 10,
+  textAlign: 'left',
   cursor: 'pointer',
+  color: 'var(--fg)',
+  fontFamily: 'inherit',
+  transition: 'border-color 120ms, background 120ms',
+};
+
+const modeCardTitleStyle: CSSProperties = {
+  fontSize: 14,
+  fontWeight: 600,
+  letterSpacing: 0.2,
+};
+
+const modeCardDescStyle: CSSProperties = {
+  fontSize: 11,
+  lineHeight: 1.35,
+  color: 'var(--muted)',
+};
+
+const modeCardBadgeStyle: CSSProperties = {
+  marginTop: 6,
+  alignSelf: 'flex-start',
+  fontSize: 10,
+  textTransform: 'uppercase',
+  letterSpacing: 0.5,
+  padding: '2px 6px',
+  borderRadius: 4,
+  background: 'rgba(255,255,255,0.06)',
+  color: 'var(--muted)',
 };
 
 const secondaryBtnStyle: CSSProperties = {
@@ -243,33 +279,35 @@ export default function Landing() {
     }
   };
 
-  const handleCreate = async (e: FormEvent): Promise<void> => {
+  // Создаёт CF SFU мит. CF Realtime SFU работает в любых сетях (cross-country,
+  // CGNAT), но требует доступа к Cloudflare — там где CF блокируется на сетевом
+  // уровне (РФ, Иран), мит не поднимется. Используется по умолчанию — это
+  // надёжный вариант для большинства гостей.
+  const handleCreateCF = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
     if (createDisabled) return;
     setError(null);
     setCreating(true);
     try {
-      // На статике (GitHub Pages) бэка нет — генерим roomId локально и в P2P.
-      // Сразу с password в URL hash → E2EE для гостей по полной invite-ссылке.
+      // Serverless (GitHub Pages) — без своего бэка, генерим roomId локально.
+      // CF Realtime sessions сам создаст браузер прямо у CF API при start'е мита.
       if (serverless) {
         const id = generateRoomId();
-        const pw = generatePassword();
         markAutoJoin(id);
-        navigate(`/p2p/${id}#${pw}`);
+        navigate(`/m/${id}`);
         return;
       }
-      // Локальный сервер: пробуем POST /api/rooms; на ошибку — fallback в P2P.
       const resp = await fetch('/api/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ displayName: trimmedName }),
       });
       if (!resp.ok) {
+        // /api/rooms может быть отключён даже на «серверном» билде — генерим локально.
         if (resp.status === 405 || resp.status === 404) {
           const id = generateRoomId();
-          const pw = generatePassword();
           markAutoJoin(id);
-          navigate(`/p2p/${id}#${pw}`);
+          navigate(`/m/${id}`);
           return;
         }
         throw new Error(`HTTP ${resp.status}`);
@@ -286,6 +324,21 @@ export default function Landing() {
     } finally {
       setCreating(false);
     }
+  };
+
+  // Создаёт P2P мит через Trystero/MQTT. Прямые соединения между браузерами,
+  // никакого Cloudflare. Работает там где CF заблокирован, бесплатно навсегда —
+  // НО только если NAT'ы пробиваются: внутри одной страны почти всегда ОК,
+  // cross-country часто не пробивается (нужен TURN-сервер которого у нас в
+  // P2P-режиме нет).
+  const handleCreateP2P = (e: FormEvent): void => {
+    e.preventDefault();
+    if (createDisabled) return;
+    setError(null);
+    const id = generateRoomId();
+    const pw = generatePassword();
+    markAutoJoin(id);
+    navigate(`/p2p/${id}#${pw}`);
   };
 
   const handleJoin = (e: FormEvent): void => {
@@ -312,7 +365,7 @@ export default function Landing() {
 
         {error && <div style={errorStyle} role="alert">{error}</div>}
 
-        <form onSubmit={handleCreate} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <label style={labelStyle}>
             Ваше имя
             <input
@@ -326,14 +379,40 @@ export default function Landing() {
             />
           </label>
 
-          <button
-            type="submit"
-            disabled={createDisabled}
-            style={{ ...primaryBtnStyle, ...disabledOverride(createDisabled) }}
-          >
-            {creating ? 'Создаём…' : 'Создать мит'}
-          </button>
-        </form>
+          <div style={modeCardsStyle}>
+            <button
+              type="button"
+              disabled={createDisabled}
+              onClick={(e) => void handleCreateCF(e)}
+              style={{
+                ...modeCardBaseStyle,
+                borderColor: 'var(--accent)',
+                ...disabledOverride(createDisabled),
+              }}
+              title="Cloudflare Realtime SFU — медиа через CF edge"
+            >
+              <span style={modeCardTitleStyle}>Создать через CF</span>
+              <span style={modeCardDescStyle}>
+                Через Cloudflare. Работает в любой сети, в т.ч. cross-country и за CGNAT. Не работает где CF заблокирован.
+              </span>
+              <span style={modeCardBadgeStyle}>{creating ? 'Создаём…' : 'По умолчанию'}</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={createDisabled}
+              onClick={(e) => handleCreateP2P(e)}
+              style={{ ...modeCardBaseStyle, ...disabledOverride(createDisabled) }}
+              title="Прямые соединения между браузерами, без Cloudflare"
+            >
+              <span style={modeCardTitleStyle}>Создать через P2P</span>
+              <span style={modeCardDescStyle}>
+                Прямое соединение между браузерами. Бесплатно, без CF. Только если NAT пробивается — обычно внутри одной страны.
+              </span>
+              <span style={modeCardBadgeStyle}>E2EE</span>
+            </button>
+          </div>
+        </div>
 
         <div style={dividerStyle}>
           <span style={dividerLineStyle} aria-hidden="true" />

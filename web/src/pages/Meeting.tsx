@@ -19,6 +19,7 @@ import { navigate } from '../App';
 import { SignalClient, buildWsUrl } from '../lib/signal';
 import { MeetConnection, type MeetConnectionEvents } from '../lib/webrtc';
 import type { P2PMeetEvents } from '../lib/p2p';
+import { P2PMeetConnection } from '../lib/p2p';
 import { CFSFUConnection } from '../lib/cf-sfu';
 import { getIceServers } from '../lib/ice';
 import { getAiNoiseSuppression } from '../lib/audio-settings';
@@ -577,7 +578,10 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
   // P2P-режим теперь использует CFSFUConnection (Cloudflare Realtime SFU)
   // вместо Trystero/MQTT mesh. API совместим — те же события, те же методы,
   // только под капотом всё едет через CF anycast SFU вместо peer-to-peer.
-  const p2pConnectionRef = useRef<CFSFUConnection | null>(null);
+  // Union — startP2P() кладёт P2PMeetConnection (для /p2p/<id>), а CFSFUConnection
+  // используется только для /m/<id> через sfuConnectionRef. Раньше тут был только
+  // CFSFUConnection потому что «P2P-режим» временно был bridged на CF.
+  const p2pConnectionRef = useRef<P2PMeetConnection | CFSFUConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const statsTimerRef = useRef<number | null>(null);
   const recoveringRef = useRef<boolean>(false);
@@ -1280,7 +1284,11 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       },
     };
 
-    const conn = new CFSFUConnection(roomId, myDisplay, events, password);
+    // P2P-режим теперь действительно P2P — Trystero mesh (был временный
+    // bridge на CFSFUConnection чтобы выкатить CF быстрее). Используется
+    // для /p2p/<id> роутов, выбираемых на Landing'е как «P2P (для тех у
+    // кого CF заблокирован/нерабочий, и внутри одной страны)».
+    const conn = new P2PMeetConnection(roomId, myDisplay, events, password);
     p2pConnectionRef.current = conn;
 
     try {
