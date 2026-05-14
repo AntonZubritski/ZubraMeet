@@ -59,13 +59,38 @@ interface Props {
 // getDisplayMedia не поддерживается в большинстве мобильных браузеров
 // (iOS Safari, Android Chrome не дают screen capture API). Если его нет —
 // прячем кнопку screen-share, чтобы юзер не видел loud error.
+//
+// Дополнительно: даже если API есть (Chrome Android иногда отдаёт getDisplayMedia,
+// который тут же падает с NotAllowedError на старте) — на мобильных устройствах
+// прячем эту кнопку безусловно. UX-фича: на телефоне трансляция экрана
+// бесполезна (вертикальный экран, маленькое разрешение, обычно люди делятся
+// чем-то с десктопа).
 function isScreenShareSupported(): boolean {
   if (typeof navigator === 'undefined') return false;
+  if (isMobileDevice()) return false;
   const md = navigator.mediaDevices as MediaDevices | undefined;
   return !!md && typeof md.getDisplayMedia === 'function';
 }
 
+// Грубая мобильная-детекция. UA-sniffing (плохо в общем, но для UX-решения
+// «спрятать кнопку которая не работает» — норм) + matchMedia на pointer:coarse
+// (touch-screen без mouse) + viewport <= 600px.
+function isMobileDevice(): boolean {
+  if (typeof window === 'undefined') return false;
+  const narrowViewport = window.matchMedia?.('(max-width: 600px)').matches ?? false;
+  const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+  const uaMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+    navigator.userAgent || '',
+  );
+  return uaMobile || (narrowViewport && coarsePointer);
+}
+
 const ICON_SIZE = 20;
+const BTN_SIZE_DESKTOP = 48;
+// 38px — кнопка чуть меньше, но 20px иконка влезает с ~9px padding'а. Все 6
+// кнопок (mic, cam, smile, chat, copy, settings, leave — без screen-share)
+// в сумме ≈ 6×38 + 5×6gap = 258px, спокойно влезает в ширину iPhone SE (375px).
+const BTN_SIZE_MOBILE = 38;
 
 const barStyle: CSSProperties = {
   position: 'fixed',
@@ -111,14 +136,12 @@ const barHiddenStyle: CSSProperties = {
 
 type Variant = 'default' | 'off' | 'leave' | 'active';
 
-function buttonStyle(variant: Variant, hovered: boolean): CSSProperties {
+function buttonStyle(variant: Variant, hovered: boolean, mobile = false): CSSProperties {
+  const size = mobile ? BTN_SIZE_MOBILE : BTN_SIZE_DESKTOP;
   const base: CSSProperties = {
-    width: 48,
-    height: 48,
-    // flexShrink:0 — без этого внутри flex-bar'а кнопки сжимались бы, чтобы
-    // влезть в width родителя, и иконки превращались в овалы. С max-width
-    // + overflow-x:auto на bar'е (см. barStyle), bar теперь скроллится
-    // горизонтально на мобиле, а кнопки сохраняют свои 48×48.
+    width: size,
+    height: size,
+    // flexShrink:0 — без этого внутри flex-bar'а кнопки сжимались бы.
     flexShrink: 0,
     borderRadius: '50%',
     border: '1px solid var(--border)',
@@ -175,6 +198,9 @@ interface CircleButtonProps {
   // (cam/mic permission denied) — поверх обычной иконки рисуется «?».
   badge?: ReactNode;
   children: ReactNode;
+  // Mobile flag — уменьшает размер кнопки с 48 до 38px. Передаётся из
+  // Controls.isMobile (определяется один раз на mount через UA + matchMedia).
+  mobile?: boolean;
 }
 
 const badgeWrapStyle: CSSProperties = {
@@ -209,13 +235,14 @@ function CircleButton({
   pressed,
   badge,
   children,
+  mobile = false,
 }: CircleButtonProps) {
   const [hovered, setHovered] = useState(false);
   return (
     <span style={badgeWrapStyle}>
       <button
         type="button"
-        style={buttonStyle(variant, hovered)}
+        style={buttonStyle(variant, hovered, mobile)}
         onClick={onClick}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
@@ -700,8 +727,9 @@ interface SmileButtonProps {
   onPickEmoji(emoji: string): void;
   onPickGif?(url: string, width: number, height: number): void;
   customerId?: string;
+  mobile?: boolean;
 }
-function SmileButton({ onPickEmoji, onPickGif, customerId }: SmileButtonProps) {
+function SmileButton({ onPickEmoji, onPickGif, customerId, mobile = false }: SmileButtonProps) {
   const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
 
@@ -727,7 +755,7 @@ function SmileButton({ onPickEmoji, onPickGif, customerId }: SmileButtonProps) {
     <div style={wrapperStyle}>
       <button
         type="button"
-        style={buttonStyle('default', hovered)}
+        style={buttonStyle('default', hovered, mobile)}
         onClick={() => setOpen((v) => !v)}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
@@ -760,8 +788,9 @@ interface ChatButtonProps {
   open: boolean;
   unread: number;
   onClick(): void;
+  mobile?: boolean;
 }
-function ChatButton({ open, unread, onClick }: ChatButtonProps) {
+function ChatButton({ open, unread, onClick, mobile = false }: ChatButtonProps) {
   const [hovered, setHovered] = useState(false);
   const variant: Variant = open ? 'active' : 'default';
   const showBadge = !open && unread > 0;
@@ -798,7 +827,7 @@ function ChatButton({ open, unread, onClick }: ChatButtonProps) {
     <div style={wrapperStyle}>
       <button
         type="button"
-        style={buttonStyle(variant, hovered)}
+        style={buttonStyle(variant, hovered, mobile)}
         onClick={onClick}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
@@ -841,7 +870,13 @@ export default function Controls({
   onToggleChat,
   hidden = false,
 }: Props) {
-  const style: CSSProperties = hidden ? { ...barStyle, ...barHiddenStyle } : barStyle;
+  // Detect once на mount — orientation/resize в реальном звонке редок, не
+  // делаем реактивный matchMedia listener. UA-based, ничего страшного.
+  const isMobile = isMobileDevice();
+  const baseBar: CSSProperties = isMobile
+    ? { ...barStyle, gap: 6, padding: '6px 8px' }
+    : barStyle;
+  const style: CSSProperties = hidden ? { ...baseBar, ...barHiddenStyle } : baseBar;
   const micLabel = !micAvailable
     ? 'Нет доступа к микрофону — разрешите в настройках браузера'
     : micOn
@@ -855,6 +890,7 @@ export default function Controls({
   return (
     <div style={style} role="toolbar" aria-label="Управление звонком" aria-hidden={hidden}>
       <CircleButton
+        mobile={isMobile}
         variant={micAvailable && micOn ? 'default' : 'off'}
         onClick={onToggleMic}
         pressed={!micAvailable || !micOn}
@@ -865,6 +901,7 @@ export default function Controls({
       </CircleButton>
 
       <CircleButton
+        mobile={isMobile}
         variant={camAvailable && camOn ? 'default' : 'off'}
         onClick={onToggleCam}
         pressed={!camAvailable || !camOn}
@@ -884,14 +921,16 @@ export default function Controls({
       )}
 
       <SmileButton
+        mobile={isMobile}
         onPickEmoji={onSendReaction}
         {...(onSendGif ? { onPickGif: onSendGif } : {})}
         {...(customerId ? { customerId } : {})}
       />
 
-      <ChatButton open={chatOpen} unread={unreadChat} onClick={onToggleChat} />
+      <ChatButton open={chatOpen} unread={unreadChat} onClick={onToggleChat} mobile={isMobile} />
 
       <CircleButton
+        mobile={isMobile}
         variant="default"
         onClick={onCopyInvite}
         ariaLabel="Скопировать ссылку-приглашение"
@@ -901,6 +940,7 @@ export default function Controls({
 
       {onOpenSettings && (
         <CircleButton
+          mobile={isMobile}
           variant="default"
           onClick={onOpenSettings}
           ariaLabel="Настройки"
@@ -910,6 +950,7 @@ export default function Controls({
       )}
 
       <CircleButton
+        mobile={isMobile}
         variant="leave"
         onClick={onLeave}
         ariaLabel="Покинуть встречу"
