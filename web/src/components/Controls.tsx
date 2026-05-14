@@ -86,6 +86,15 @@ const barStyle: CSSProperties = {
   zIndex: 100,
   transition: 'transform 250ms ease, opacity 250ms ease',
   opacity: 1,
+  // Mobile fit: на узких экранах bar шире viewport'а — кнопки обрезались по
+  // краям. Ограничиваем max-width и даём горизонтальный скролл; scrollbar
+  // прячем (на мобилке всё равно свайпом). На десктопе влезает без скролла.
+  maxWidth: 'calc(100vw - 16px)',
+  overflowX: 'auto',
+  scrollbarWidth: 'none',
+  // Кнопки не должны сжиматься под weight gap'а — фиксируем флекс-базис.
+  // (Этого недостаточно само по себе — нужно ещё на каждую кнопку flex-shrink:0,
+  // см. iconBtnStyle ниже.)
 };
 
 // Стиль когда bar скрыт (idle 5с): уезжает вниз за пределы viewport
@@ -106,6 +115,11 @@ function buttonStyle(variant: Variant, hovered: boolean): CSSProperties {
   const base: CSSProperties = {
     width: 48,
     height: 48,
+    // flexShrink:0 — без этого внутри flex-bar'а кнопки сжимались бы, чтобы
+    // влезть в width родителя, и иконки превращались в овалы. С max-width
+    // + overflow-x:auto на bar'е (см. barStyle), bar теперь скроллится
+    // горизонтально на мобиле, а кнопки сохраняют свои 48×48.
+    flexShrink: 0,
     borderRadius: '50%',
     border: '1px solid var(--border)',
     background: 'var(--panel)',
