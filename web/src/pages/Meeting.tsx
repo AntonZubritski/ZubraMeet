@@ -1141,13 +1141,27 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         // как pull tracks доедет до ontrack, юзер уже знает что не один).
         setConnecting(false);
         peerNamesRef.current.set(peerId, name);
-        // Если поток уже есть — обновляем имя.
+        // Создаём placeholder tile сразу при peer-joined — без ожидания
+        // onRemoteStream. Это критично для случаев когда у peer'а CF session
+        // не поднялась (его sessionId в DO остался null, мы не можем pull'нуть
+        // его tracks, но он в комнате через WS — пишет в чат, шлёт реакции).
+        // Без placeholder'а такой peer выглядит как «никого нет» хотя чат с
+        // ним работает. Stream — пустой MediaStream, camMuted/micMuted=true →
+        // VideoTile отрендерит аватар. Когда (или если) реальный stream
+        // придёт через onRemoteStream — он заменит placeholder.
         setPeers((prev) => {
-          if (!prev.has(peerId)) return prev;
           const next = new Map(prev);
           const cur = next.get(peerId);
           if (cur) {
-            next.set(peerId, { stream: cur.stream, name });
+            // Обновляем только имя — stream/mute-флаги не трогаем.
+            next.set(peerId, { ...cur, name });
+          } else {
+            next.set(peerId, {
+              stream: new MediaStream(),
+              name,
+              camMuted: true,
+              micMuted: true,
+            });
           }
           return next;
         });
@@ -1309,11 +1323,15 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
       },
     };
 
-    // P2P-режим теперь действительно P2P — Trystero mesh (был временный
-    // bridge на CFSFUConnection чтобы выкатить CF быстрее). Используется
-    // для /p2p/<id> роутов, выбираемых на Landing'е как «P2P (для тех у
-    // кого CF заблокирован/нерабочий, и внутри одной страны)».
-    const conn = new P2PMeetConnection(roomId, myDisplay, events, password);
+    // Развилка по route'у (не по resolvedMode!): /p2p/<id> создаёт реальный
+    // Trystero mesh, /m/<id> создаёт CFSFUConnection. resolvedMode для этого
+    // НЕЛЬЗЯ использовать — на serverless deploy он почти всегда выходит
+    // 'p2p' (потому что resolveMode дёргает /api/mode который возвращает 404
+    // → fallback 'p2p'). До этой развилки оба пути попадают в startP2P, и без
+    // ветвления по modeProp юзер на /m/<id> улетал бы в Trystero вместо CF.
+    const conn = modeProp === 'p2p'
+      ? new P2PMeetConnection(roomId, myDisplay, events, password)
+      : new CFSFUConnection(roomId, myDisplay, events, password);
     p2pConnectionRef.current = conn;
 
     try {
