@@ -973,11 +973,24 @@ export class CFSFUConnection {
         peer.screenStream = new MediaStream();
       }
       replaceTrackInStream(peer.screenStream, event.track);
+      console.info(
+        '[zubrameet/cf-sfu] screen track attached',
+        { peerId: meta.peerId, kind: event.track.kind, trackName: meta.trackName, mid },
+      );
       if (!peer.emittedScreen) {
         peer.emittedScreen = true;
         try {
           this.events.onRemoteStream(peer.peerId, peer.screenStream, peer.name, 'screen');
         } catch (err) { this.reportError(err, 'onRemoteStream(screen)'); }
+      }
+      // Дополнительная защита от «чёрного экрана после reload»: через 3 сек
+      // проверяем что реально идут frames по этому mid'у. Если frameDecoded
+      // не растёт — CF выдал stale mid (zombie от прошлой публикации, либо
+      // encoder publisher'а не шлёт), форсируем re-pull через очистку
+      // emittedScreen+midToPeer и постановку wantsScreen → periodic-pull
+      // подхватит на следующем тике.
+      if (event.track.kind === 'video') {
+        this.scheduleScreenFrameCheck(meta.peerId, mid);
       }
       return;
     }
@@ -999,6 +1012,64 @@ export class CFSFUConnection {
         this.events.onRemoteStream(peer.peerId, peer.cameraStream, peer.name, 'camera');
       } catch (err) { this.reportError(err, 'onRemoteStream'); }
     }
+  }
+
+  // Проверка через 3с: реально ли идут frames по screen-track'у. Если CF
+  // выдал stale mid (zombie от прошлого publish'а — мы видели такое после
+  // reload одного из peer'ов), inboundRtp.framesDecoded остаётся 0. Тогда
+  // сбрасываем mapping + emittedScreen, чтобы periodic-pull снова pull'нул
+  // и получил свежий mid с реальным потоком.
+  private scheduleScreenFrameCheck(peerId: string, mid: string): void {
+    window.setTimeout(() => {
+      if (this.closed || !this.pc) return;
+      const peer = this.peers.get(peerId);
+      if (!peer || !peer.emittedScreen) return;
+      void this.pc.getStats().then((stats) => {
+        let frames = 0;
+        let bytes = 0;
+        let found = false;
+        stats.forEach((report) => {
+          if (report.type === 'inbound-rtp') {
+            const r = report as RTCInboundRtpStreamStats & { mid?: string };
+            if (r.mid === mid && r.kind === 'video') {
+              found = true;
+              frames = r.framesDecoded ?? 0;
+              bytes = r.bytesReceived ?? 0;
+            }
+          }
+        });
+        console.info(
+          '[zubrameet/cf-sfu] screen frame check',
+          { peerId, mid, found, frames, bytes },
+        );
+        if (!found || frames === 0) {
+          console.warn(
+            '[zubrameet/cf-sfu] screen track has no frames — forcing re-pull',
+            { peerId, mid },
+          );
+          // Чистим mapping для screen-mid'ов этого peer'а (как при
+          // screen-state inactive) и сбрасываем emittedScreen — periodic-pull
+          // через ≤2 сек снова пойдёт за треком.
+          const mids = peer.peerId
+            ? this.peerToMids.get(peer.peerId)
+            : null;
+          if (mids) {
+            const toRemove: string[] = [];
+            for (const m of mids) {
+              const meta = this.midToPeer.get(m);
+              if (meta?.kind === 'screen') {
+                this.midToPeer.delete(m);
+                toRemove.push(m);
+              }
+            }
+            for (const m of toRemove) mids.delete(m);
+          }
+          peer.screenStream = null;
+          peer.emittedScreen = false;
+          // wantsScreen остаётся true — periodic-pull повторит.
+        }
+      }).catch(() => { /* getStats fail ok */ });
+    }, 3000);
   }
 
   // ─── CF SFU: pull peer screen-track ───────────────────────────────────────
