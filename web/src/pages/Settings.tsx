@@ -206,6 +206,108 @@ function AudioSettingsCard() {
   );
 }
 
+// Карточка-инструкция: как развернуть ZubraMeet на своём облаке, чтобы
+// получить cloud-relay (TURN-сервер для гостей за CGNAT / cross-country).
+// Показывается на serverless-сборках (GitHub Pages) — там бэкенда нет, и
+// сам конфиг провайдера задаётся уже из локального бинарника, после того
+// как пользователь его развернул. Не интерактивна, только текст + ссылки.
+function SelfHostHowtoCard() {
+  const cmdStyle: CSSProperties = {
+    display: 'block',
+    background: 'var(--bg)',
+    border: '1px solid var(--border)',
+    borderRadius: 6,
+    padding: '8px 10px',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontSize: 12,
+    color: 'var(--fg)',
+    overflowX: 'auto',
+    whiteSpace: 'pre',
+  };
+  const stepStyle: CSSProperties = {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    fontSize: 13,
+    color: 'var(--fg)',
+    lineHeight: 1.5,
+  };
+  const stepNumStyle: CSSProperties = {
+    display: 'inline-flex',
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 11,
+    background: 'var(--accent)',
+    color: '#0a0a0a',
+    fontWeight: 600,
+    fontSize: 12,
+    marginRight: 8,
+  };
+  return (
+    <div style={cardStyle}>
+      <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--fg)' }}>
+        Cloud-relay (self-hosted)
+      </div>
+      <p style={{ ...subtitleStyle, margin: 0 }}>
+        Хочешь, чтобы гости из любой сети (cross-country, CGNAT, мобильные)
+        пробивались на твой мит без Cloudflare? Подними локально ZubraMeet —
+        он автоматически развернёт временную VM-TURN на твоём облаке.
+        Поддерживается Hetzner; платишь ~€0.5/час напрямую провайдеру.
+      </p>
+
+      <div style={stepStyle}>
+        <div>
+          <span style={stepNumStyle}>1</span>
+          Склонируй и собери бинарник (нужен Go 1.22+):
+        </div>
+        <code style={cmdStyle}>{
+          'git clone https://github.com/AntonZubritski/ZubraMeet\n' +
+          'cd ZubraMeet\n' +
+          'make build   # или: go build -o zubrameet .'
+        }</code>
+      </div>
+
+      <div style={stepStyle}>
+        <div>
+          <span style={stepNumStyle}>2</span>
+          Запусти. Бинарник откроет UI на <code>localhost:7777</code>:
+        </div>
+        <code style={cmdStyle}>{'./zubrameet'}</code>
+      </div>
+
+      <div style={stepStyle}>
+        <div>
+          <span style={stepNumStyle}>3</span>
+          Открой{' '}
+          <a href="http://localhost:7777/settings" style={helperLinkStyle}>
+            http://localhost:7777/settings
+          </a>
+          {' '}— там появится секция Cloud-relay с выбором провайдера и полем для
+          API-токена. Получи токен в{' '}
+          <a
+            href="https://console.hetzner.cloud/projects"
+            target="_blank"
+            rel="noreferrer noopener"
+            style={helperLinkStyle}
+          >
+            Hetzner Cloud Console
+          </a>
+          {' '}(права read+write на Servers / SSH Keys / Networks), включи галочку —
+          и сможешь стартовать VM прямо из активного мита.
+        </div>
+      </div>
+
+      <p style={{ ...subtitleStyle, margin: 0, fontSize: 12 }}>
+        Если cloud-relay тебе не нужен — используй кнопки на главной:{' '}
+        <strong>CF</strong> работает в любой сети, <strong>P2P</strong>{' '}
+        бесплатно работает внутри одной страны.
+      </p>
+    </div>
+  );
+}
+
 interface UrlParams {
   prefilledProvider: string | null;
 }
@@ -380,11 +482,7 @@ export default function Settings() {
             <h1 style={titleStyle}>Настройки</h1>
           </div>
           <AudioSettingsCard />
-          <div style={messageStyle('info')}>
-            Cloud-relay недоступен в этой сборке. Эта фича работает только когда
-            ZubraMeet запущен локально как бинарник (хост-сервер). В web-версии
-            используй обычный CF или P2P режим — оба не требуют TURN-сервера.
-          </div>
+          <SelfHostHowtoCard />
         </div>
       </div>
     );
