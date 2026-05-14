@@ -1226,8 +1226,16 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         setPeers((prev) => {
           const cur = prev.get(peerId);
           if (!cur) return prev;
-          const camMuted = !state.cam;
-          const micMuted = !state.mic;
+          // КРИТИЧНО: если у нас placeholder stream без реальных video-треков
+          // (peer-joined создал его до того как пришёл pull от CF SFU), нельзя
+          // разрешать camMuted=false — даже если peer прислал mediaState{cam:true}.
+          // Иначе VideoTile попытается отрендерить <video> с пустым stream'ом
+          // → ЧЁРНЫЙ ЭКРАН. Держим camMuted=true пока реальный video-track не
+          // приедет через onRemoteStream. То же для аудио и mic.
+          const hasRealVideoTrack = cur.stream.getVideoTracks().length > 0;
+          const hasRealAudioTrack = cur.stream.getAudioTracks().length > 0;
+          const camMuted = !state.cam || !hasRealVideoTrack;
+          const micMuted = !state.mic || !hasRealAudioTrack;
           if ((cur.camMuted ?? false) === camMuted && (cur.micMuted ?? false) === micMuted) {
             return prev;
           }
