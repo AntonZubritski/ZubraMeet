@@ -132,15 +132,26 @@ const modeCardDescStyle: CSSProperties = {
 };
 
 const modeCardBadgeStyle: CSSProperties = {
-  marginTop: 6,
+  // marginTop: 'auto' прижимает badge к низу карточки независимо от того,
+  // насколько длинное описание выше. Без этого CF-карта с 4 строками
+  // описания и P2P-карта с 5 строками показывали бы badges на разной
+  // высоте — выглядело криво.
+  marginTop: 'auto',
+  paddingTop: 8,
   alignSelf: 'flex-start',
   fontSize: 10,
   textTransform: 'uppercase',
   letterSpacing: 0.5,
+  color: 'var(--muted)',
+};
+
+// Внутренний span бэйджа — отдельная подложка с padding'ом и border-radius,
+// чтобы paddingTop у самого badge'а не влиял на размер цветной плашки.
+const modeCardBadgePillStyle: CSSProperties = {
+  display: 'inline-block',
   padding: '2px 6px',
   borderRadius: 4,
   background: 'rgba(255,255,255,0.06)',
-  color: 'var(--muted)',
 };
 
 const secondaryBtnStyle: CSSProperties = {
@@ -395,7 +406,11 @@ export default function Landing() {
               <span style={modeCardDescStyle}>
                 Через Cloudflare. Работает в любой сети, в т.ч. cross-country и за CGNAT. Не работает где CF заблокирован.
               </span>
-              <span style={modeCardBadgeStyle}>{creating ? 'Создаём…' : 'По умолчанию'}</span>
+              <span style={modeCardBadgeStyle}>
+                <span style={modeCardBadgePillStyle}>
+                  {creating ? 'Создаём…' : 'По умолчанию'}
+                </span>
+              </span>
             </button>
 
             <button
@@ -409,7 +424,9 @@ export default function Landing() {
               <span style={modeCardDescStyle}>
                 Прямое соединение между браузерами. Бесплатно, без CF. Только если NAT пробивается — обычно внутри одной страны.
               </span>
-              <span style={modeCardBadgeStyle}>E2EE</span>
+              <span style={modeCardBadgeStyle}>
+                <span style={modeCardBadgePillStyle}>E2EE</span>
+              </span>
             </button>
           </div>
         </div>
