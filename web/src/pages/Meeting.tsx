@@ -1230,6 +1230,17 @@ export default function Meeting({ roomId, mode: modeProp = 'auto', password }: P
         setScreenSharing(false);
         setScreenStream(null);
       },
+      onScreenQualityDowngraded: (info) => {
+        // CF SFU watchdog снизил fps из-за CPU pressure. Логируем; делать
+        // полноэкранный error overlay тут нельзя (он рендерится вместо мита,
+        // см. ErrorState ниже). Toast-инфраструктуры нет — для v1 достаточно
+        // console для диагностики, юзер просто увидит плавную картинку
+        // вместо дёрганной. Если будет нужна явная плашка — добавим mini-toast.
+        console.warn(
+          `[Meeting] screen quality auto-downgraded to ${info.targetFps}fps`,
+          `(reason: ${info.reason})`,
+        );
+      },
       onPeerMediaState: (peerId, state) => {
         // Удалённый peer broadcast'нул новое cam/mic. Обновляем флаги — это
         // даёт visual placeholder (аватар вместо застывшего кадра) и

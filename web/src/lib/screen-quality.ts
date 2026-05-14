@@ -59,7 +59,11 @@ export const SCREEN_QUALITY_PRESETS: Record<ScreenQuality, ScreenQualityPreset> 
   },
 };
 
-export const DEFAULT_SCREEN_QUALITY: ScreenQuality = 'hd60';
+// 1080p30 — sweet spot для большинства железа и контента (доки, IDE,
+// презентации). 60fps требует ~2× CPU на VP9 encode и часто не влезает в
+// бюджет 16.6ms/кадр на типичных машинах → фризы и drop frames. Если юзер
+// хочет 60 — выбирает в dropdown'е (видит «60fps» лейбл рядом с пресетом).
+export const DEFAULT_SCREEN_QUALITY: ScreenQuality = 'hd30';
 
 export function getScreenQualityPreset(q: ScreenQuality): ScreenQualityPreset {
   return SCREEN_QUALITY_PRESETS[q] ?? SCREEN_QUALITY_PRESETS[DEFAULT_SCREEN_QUALITY];

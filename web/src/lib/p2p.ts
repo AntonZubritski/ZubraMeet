@@ -121,6 +121,10 @@ export interface P2PMeetEvents {
   // Локальный screen-share API (mirror MeetConnection events).
   onScreenShareStarted?(stream: MediaStream): void;
   onScreenShareStopped?(): void;
+  // Локальный screen-encoder автоматически снизил качество из-за нагрузки на
+  // CPU / канал. Caller может показать toast/badge. Только в CF SFU режиме
+  // (P2PMeetConnection эту телеметрию не считает).
+  onScreenQualityDowngraded?(info: { reason: 'cpu' | 'bandwidth'; targetFps: number }): void;
   // Удалённый peer обновил cam/mic state. Используется для отрисовки
   // placeholder'а с аватаром (вместо последнего «застывшего» кадра).
   onPeerMediaState?(peerId: string, state: P2PMediaState): void;

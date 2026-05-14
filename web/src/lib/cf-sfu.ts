@@ -144,6 +144,16 @@ export class CFSFUConnection {
   // (removeTrack + null replaceTrack) оставляла зомби-треки в CF SFU session,
   // потому что CF не понимает что трек реально закрыт без явного /tracks/close.
   private screenTransceivers: RTCRtpTransceiver[] = [];
+  // CPU watchdog для screen-share. VP9 encode на 1080p60 — на грани бюджета
+  // 16.6ms/кадр на типичных машинах. Если encoder проседает, getStats()
+  // выставит qualityLimitationReason='cpu'. Watchdog держит счётчик
+  // последовательных секунд с cpu-pressure'ом — после ≥5с автоматически
+  // снижает maxFramerate до 30, что разгружает encoder вдвое. На decay не
+  // возвращаемся (после рестарта share — да): иначе пользователь увидит
+  // мерцание качества при колебаниях нагрузки.
+  private screenCpuLimitedSeconds = 0;
+  private screenCpuDowngraded = false;
+  private screenCpuWatchdogTimer: number | null = null;
 
   private readonly peers: Map<string, PeerEntry> = new Map();
   // mid → (peerId, kind). Заполняется из ответов /tracks/new (location='remote').
@@ -316,6 +326,7 @@ export class CFSFUConnection {
       window.clearInterval(this.periodicPullTimer);
       this.periodicPullTimer = null;
     }
+    this.stopScreenCpuWatchdog();
     // Останавливаем screen-share треки — мы их создавали (getDisplayMedia),
     // мы и убираем. localStream (камера) принадлежит caller'у, не трогаем.
     if (this.screenStream) {
@@ -1351,28 +1362,27 @@ export class CFSFUConnection {
     this.screenTransceivers = [];
     try {
       // VP9 SVC (Scalable Video Coding) — внутри ОДНОГО RTP-потока зашиваем
-      // несколько scalability layers (3 spatial × 3 temporal в режиме K_SVC).
-      // Upload остаётся равен preset.maxBitrate, как у обычного single-layer
-      // encoding — никакого +1.5× simulcast tax. При этом CF SFU умеет
-      // отбрасывать «верхние» layers для каждого получателя независимо: у
-      // кого слабый канал — получит низкое разрешение и/или меньше fps;
-      // у кого быстрый — полный поток. Это работает только если CF получит
-      // VP9-поток (H.264 SVC в браузерах не поддерживается, VP8 SVC —
-      // только temporal). Поэтому ниже принудительно ставим VP9 в codec
-      // preferences ДО createOffer.
+      // несколько scalability layers, и CF SFU отдаёт каждому получателю
+      // нужную «глубину» layers'ов независимо. Upload остаётся равен
+      // preset.maxBitrate (никакого simulcast tax).
       //
-      // L3T3_KEY = 3 spatial × 3 temporal с aligned key-frames (важно для
-      // screen-share — позволяет SFU чисто переключаться между layers без
-      // визуальных артефактов). Если encoder/браузер не поддержит — поле
-      // scalabilityMode будет проигнорировано и поток поедет single-layer.
-      // scalabilityMode пока не описан в стандартном lib.dom.d.ts (это
-      // относительно свежий WebRTC SVC API), поэтому передаём через cast.
-      // Браузеры которые не понимают поле — просто игнорируют.
+      // L1T3 = 1 spatial × 3 temporal. РАНЬШЕ был L3T3_KEY (3 spatial × 3
+      // temporal с aligned key-frames). Spatial-layers удвоили-утроили CPU
+      // на encoder'е — на 1080p60 это пробивало 16.6ms/кадр бюджет, encoder
+      // тормозил, появлялись drop frames и фриз. Spatial scaling нужен когда
+      // у получателей сильно разные resolution'ы / bandwidth'ы. Для мита 2-5
+      // человек это редкий случай — лучше держать одну spatial layer и дать
+      // CPU encoder'у спокойно работать. Temporal layers (3 штуки) остаются —
+      // CF может отдать слабому получателю каждый 2-й или 4-й кадр и
+      // получить эффективный 30fps / 15fps без encoder-side стоимости.
+      //
+      // VP9-кодек принудительно ниже через setCodecPreferences. H.264 в
+      // браузерах не умеет SVC, VP8 умеет только temporal.
       const videoTrx = this.pc.addTransceiver(videoTrack, {
         direction: 'sendonly',
         streams: [stream],
         sendEncodings: [{
-          scalabilityMode: 'L3T3_KEY',
+          scalabilityMode: 'L1T3',
         } as RTCRtpEncodingParameters],
       });
       videoSender = videoTrx.sender;
@@ -1486,7 +1496,92 @@ export class CFSFUConnection {
     try { this.events.onScreenShareStarted?.(stream); }
     catch (err) { this.reportError(err, 'onScreenShareStarted'); }
 
+    // CPU watchdog: следим за encoder pressure'ом, если он сохраняется —
+    // автоматически уроним fps. Только если стартанули с 60fps — на 30fps
+    // снижать уже некуда (и watchdog'у нечего делать).
+    if (videoSender && preset.frameRate > 30) {
+      this.startScreenCpuWatchdog(videoSender);
+    }
+
     return stream;
+  }
+
+  private startScreenCpuWatchdog(videoSender: RTCRtpSender): void {
+    if (this.screenCpuWatchdogTimer !== null) return;
+    this.screenCpuLimitedSeconds = 0;
+    this.screenCpuDowngraded = false;
+    this.screenCpuWatchdogTimer = window.setInterval(() => {
+      if (this.closed || !this.screenStream) {
+        this.stopScreenCpuWatchdog();
+        return;
+      }
+      if (this.screenCpuDowngraded) {
+        // Уже даунгрейднулись — не нужно больше проверять, не возвращаемся
+        // обратно до stop/start (избегаем мерцания качества).
+        this.stopScreenCpuWatchdog();
+        return;
+      }
+      void videoSender.getStats().then((stats) => {
+        let cpuLimited = false;
+        stats.forEach((report) => {
+          if (report.type === 'outbound-rtp') {
+            const r = report as RTCOutboundRtpStreamStats & { qualityLimitationReason?: string };
+            if (r.qualityLimitationReason === 'cpu') {
+              cpuLimited = true;
+            }
+          }
+        });
+        if (cpuLimited) {
+          this.screenCpuLimitedSeconds += 1;
+          if (this.screenCpuLimitedSeconds >= 5) {
+            console.warn(
+              '[zubrameet/cf-sfu] screen: sustained CPU pressure, downgrading to 30fps',
+            );
+            this.downgradeScreenFrameRate(videoSender, 30);
+            this.screenCpuDowngraded = true;
+            this.stopScreenCpuWatchdog();
+          }
+        } else {
+          // Сброс счётчика — нужно ≥5 секунд ПОДРЯД, а не накопительно.
+          this.screenCpuLimitedSeconds = 0;
+        }
+      }).catch(() => { /* getStats fail ok */ });
+    }, 1000);
+  }
+
+  private stopScreenCpuWatchdog(): void {
+    if (this.screenCpuWatchdogTimer !== null) {
+      window.clearInterval(this.screenCpuWatchdogTimer);
+      this.screenCpuWatchdogTimer = null;
+    }
+  }
+
+  private async downgradeScreenFrameRate(
+    videoSender: RTCRtpSender,
+    targetFps: number,
+  ): Promise<void> {
+    try {
+      const params = videoSender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      for (const enc of params.encodings) {
+        enc.maxFramerate = targetFps;
+      }
+      await videoSender.setParameters(params);
+      console.info(
+        '[zubrameet/cf-sfu] screen maxFramerate downgraded to',
+        targetFps,
+        'fps (CPU pressure)',
+      );
+      // Сообщаем UI через дополнительное событие — если caller подписан, может
+      // показать toast/badge «Качество снижено из-за CPU».
+      try {
+        this.events.onScreenQualityDowngraded?.({ reason: 'cpu', targetFps });
+      } catch { /* ignore */ }
+    } catch (err) {
+      console.warn('[zubrameet/cf-sfu] failed to downgrade screen fps', err);
+    }
   }
 
   /**
@@ -1496,6 +1591,9 @@ export class CFSFUConnection {
     const stream = this.screenStream;
     if (!stream) return;
     this.screenStream = null;
+    this.stopScreenCpuWatchdog();
+    this.screenCpuDowngraded = false;
+    this.screenCpuLimitedSeconds = 0;
 
     // Сразу broadcast — receiver'ы уберут screen-tile даже не дожидаясь
     // нашего sender cleanup'а.
