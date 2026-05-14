@@ -518,6 +518,13 @@ export class CFSFUConnection {
       // screen-share, и пока он не пришлёт нам новое screen-state{active:true},
       // periodic-pull дёргать screen бессмысленно.
       entry.wantsScreen = false;
+      // КРИТИЧНО для reload-сценария: если на момент session change у нас
+      // был in-flight pull (cameraPullInFlight/screenPullInFlight=true), он
+      // НЕ должен блокировать новый pull. Иначе после reload пира periodic
+      // re-pull видит флаг и каждые 2с тихо скипает peer'а → его mic/camera
+      // никогда не подтягиваются → у нас он висит как «muted в placeholder'е».
+      entry.cameraPullInFlight = false;
+      entry.screenPullInFlight = false;
       entry.sessionId = sessionId;
     }
 
